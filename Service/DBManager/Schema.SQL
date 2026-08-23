@@ -12,7 +12,7 @@ USE smartmart;
 -- member
 -- ----------------------------------------------------------------------
 DROP TABLE IF EXISTS order_item;
-DROP TABLE IF EXISTS `order`;
+DROP TABLE IF EXISTS orders;
 DROP TABLE IF EXISTS product;
 DROP TABLE IF EXISTS member;
 
@@ -37,10 +37,8 @@ CREATE TABLE product (
     stock   INT NOT NULL DEFAULT 0
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
--- ----------------------------------------------------------------------
--- order  (예약어라 백틱 필요)
--- ----------------------------------------------------------------------
-CREATE TABLE `order` (
+
+CREATE TABLE orders (
     id              INT AUTO_INCREMENT PRIMARY KEY,
     member_id       INT NOT NULL,
     status          ENUM('대기', '결제완료', '출고중', '픽업대기', '완료')
@@ -61,7 +59,7 @@ CREATE TABLE order_item (
     product_id  INT NOT NULL,
     qty         INT NOT NULL,
     CONSTRAINT fk_order_item_order
-        FOREIGN KEY (order_id) REFERENCES `order`(id),
+        FOREIGN KEY (order_id) REFERENCES orders(id),
     CONSTRAINT fk_order_item_product
         FOREIGN KEY (product_id) REFERENCES product(id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
