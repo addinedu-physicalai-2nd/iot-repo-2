@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(timeout 5 /home/msm/venv/smartMart_venv/bin/python Service/MainService/mainService.py)",
+      "Bash(timeout 5 /home/msm/venv/smartMart_venv/bin/python -u Service/MainService/mainService.py)",
+      "Bash(nohup /home/msm/venv/smartMart_venv/bin/python -u Service/MainService/mainService.py)",
+      "Bash(echo \"PID=$!\")",
+      "Bash(timeout 5 /home/msm/venv/smartMart_venv/bin/python -c ' *)",
+      "Bash(kill 31142)",
+      "Bash(ps -o pid,etimes,stat,cmd -p 31297)",
+      "Bash(timeout 8 /home/msm/venv/smartMart_venv/bin/python -c ' *)"
+    ]
+  }
+}
