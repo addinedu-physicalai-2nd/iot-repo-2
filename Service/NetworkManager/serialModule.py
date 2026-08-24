@@ -1,71 +1,90 @@
 """
-serialModule.py
-NetworkManager가 사용하는 Serial 통신 모듈 — 픽업보드 전용
+network/serialModule.py — USB 로 직결된 제어 보드와 Serial 통신 (스레드 기반)
 
-프로토콜: JSON 한 줄 + 개행문자('\\n')
-    보드 -> 서버: {"hello":"pickup"}                          (접속 시 1회)
-    보드 -> 서버: {"event":"slotState","boardId":"pickup","slot":1,"occupied":true}
+핵심 원칙:
+  - 수신 스레드는 orders 를 건드리지 않는다. 센서 이벤트를 큐에 넣기만.
+  - 어느 명령을 이 보드로 보낼지(라우팅)는 NetworkManager 가 정한다.
+    여기는 '이 포트로 JSON 한 줄 주고받기' 만 한다.
+
+보드 이름을 갖는다. WiFi 보드(BoardHub)와 같은 형식으로 큐에 넣기 위해서다:
+  inQueue.put(("board", boardName, msg))
+그래서 CentralControl 은 보드가 USB 인지 WiFi 인지 몰라도 된다.
+
+수신 예: 보드가 JSON 한 줄 + '\n' 로 올림
+  {"event": "boxStatus", "boxes": [1, 0, 0]}   픽업박스 3개 점유 상태
 """
 
 import json
 import threading
-import time
+import queue
 
 try:
-    import serial
+    import serial  # pyserial
 except ImportError:
-    serial = None
+    serial = None  # 아직 설치 전이어도 import 에러 안 나게
 
 
-class SerialModule:
-    def __init__(self, port="/dev/ttyUSB0", baudrate=115200, onMessage=None):
-        """
-        onMessage: function(msg: dict) -> None
-            보드로부터 한 줄(JSON) 올 때마다 호출됨
-        """
+class SerialHandler:
+    def __init__(self, inQueue: queue.Queue, boardName: str = "board",
+                 port: str = "/dev/ttyUSB0", baud: int = 115200):
+        self.inQueue = inQueue
+        self.boardName = boardName
         self.port = port
-        self.baudrate = baudrate
-        self.onMessage = onMessage
+        self.baud = baud
         self._ser = None
         self._running = False
+        self._writeLock = threading.Lock()  # 송신 직렬화(포트 보호, orders와 무관)
 
     def start(self):
         if serial is None:
-            raise RuntimeError("pyserial이 설치되어 있지 않습니다. pip install pyserial")
-        self._ser = serial.Serial(self.port, self.baudrate, timeout=1)
-        time.sleep(2)  # 보드가 USB 연결 시 자동 리셋되는 시간 대기
+            print(f"[Serial:{self.boardName}] pyserial 미설치 — 더미 모드")
+            return
+        try:
+            self._ser = serial.Serial(self.port, self.baud, timeout=0.1)
+        except Exception as e:
+            print(f"[Serial:{self.boardName}] 포트 열기 실패({self.port}): {e} — 더미 모드")
+            return
         self._running = True
         threading.Thread(target=self._recvLoop, daemon=True).start()
-        print(f"[serialModule] connected {self.port} @ {self.baudrate}bps")
+        print(f"[Serial:{self.boardName}] 시작: {self.port} @ {self.baud}")
+
+    # ── 수신 루프: 센서 이벤트를 큐에 넣기만 ─────────────────────
+    def _recvLoop(self):
+        buffer = ""
+        while self._running:
+            try:
+                data = self._ser.readline()  # '\n' 까지 읽음(블로킹, timeout 있음)
+            except Exception:
+                continue
+            if not data:
+                continue
+            buffer += data.decode("utf-8", errors="ignore")
+            while "\n" in buffer:
+                line, buffer = buffer.split("\n", 1)
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    msg = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                # ★ orders 안 건드림. 큐로 넘김
+                self.inQueue.put(("board", self.boardName, msg))
+
+    # ── 송신 (NetworkManager 가 라우팅해서 호출) ─────────────────
+    def send(self, obj: dict) -> bool:
+        if self._ser is None:
+            print(f"[Serial:{self.boardName}] (더미) 송신: {obj}")
+            return False
+        line = (json.dumps(obj, ensure_ascii=False) + "\n").encode("utf-8")
+        with self._writeLock:
+            self._ser.write(line)
+        return True
+
+    def isOpen(self) -> bool:
+        return self._ser is not None
 
     def stop(self):
         self._running = False
         if self._ser:
             self._ser.close()
-
-    def _recvLoop(self):
-        while self._running:
-            try:
-                line = self._ser.readline()
-            except OSError:
-                break
-            if not line:
-                continue
-            try:
-                msg = json.loads(line.decode("utf-8").strip())
-            except (json.JSONDecodeError, UnicodeDecodeError):
-                continue
-            if self.onMessage:
-                self.onMessage(msg)
-
-
-if __name__ == "__main__":
-    # 단독 실행 시 테스트용 — 픽업보드에서 오는 메시지를 그냥 출력만 함
-    def printMessage(msg):
-        print("받은 메시지:", msg)
-
-    module = SerialModule(port="/dev/ttyUSB0", onMessage=printMessage)
-    module.start()
-    print("픽업보드 메시지 대기 중... Ctrl+C로 종료")
-    while True:
-        time.sleep(1)
