@@ -5,7 +5,7 @@
 const char* WIFI_SSID     = "addinedu_201class_2-2.4G";
 const char* WIFI_PASSWORD = "201class2!";
 const char* SERVER_IP     = "192.168.0.132";
-const int   SERVER_PORT   = 6000;
+const int   SERVER_PORT   = 6001;  // mainService.py camPorts["dispensing"] 와 일치
 
 const int CHUNK_SIZE = 1200;  // 패킷 하나당 최대 데이터 크기 (헤더 제외)
 
@@ -53,20 +53,27 @@ void setup() {
   config.pin_reset = RESET_GPIO_NUM;
   config.xclk_freq_hz = 10000000;
   config.pixel_format = PIXFORMAT_JPEG;
-  config.frame_size = FRAMESIZE_VGA;   // 640x480, 청크 분할이라 화질 다시 올려도 됨
   config.jpeg_quality = 12;
-  config.fb_count = psramFound() ? 2 : 1;
+
+  bool hasPsram = psramFound();
+  Serial.printf("PSRAM 감지: %s / 남은 내부 힙: %u bytes\n",
+                hasPsram ? "있음" : "없음", ESP.getFreeHeap());
+  // PSRAM 없으면 VGA(640x480) JPEG 프레임버퍼가 내부 RAM에 안 들어가서
+  // cam_dma_config 가 malloc 실패로 죽는다. QVGA 도 실패해서 QQVGA 까지 낮춘다.
+  config.frame_size = hasPsram ? FRAMESIZE_VGA : FRAMESIZE_QQVGA;
+  config.fb_count = hasPsram ? 2 : 1;
 
   if (esp_camera_init(&config) != ESP_OK) {
-    Serial.println("카메라 초기화 실패!");
+    Serial.println("카메라 초기화 실패! (배선/전원 확인 후 재부팅 필요)");
   } else {
     Serial.println("카메라 초기화 성공");
+    // 상하반전 보정 (필요시 set_hmirror로 좌우도 뒤집을 수 있음)
+    sensor_t* s = esp_camera_sensor_get();
+    if (s) {
+      s->set_vflip(s, 1);      // 1: 상하 반전 적용, 0: 원래대로
+      // s->set_hmirror(s, 1); // 좌우도 반전되어 있으면 이 줄 주석 해제
+    }
   }
-
-  // 상하반전 보정 (필요시 set_hmirror로 좌우도 뒤집을 수 있음)
-  sensor_t* s = esp_camera_sensor_get();
-  s->set_vflip(s, 1);      // 1: 상하 반전 적용, 0: 원래대로
-  // s->set_hmirror(s, 1); // 좌우도 반전되어 있으면 이 줄 주석 해제
 
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
   Serial.print("WiFi 연결중");
