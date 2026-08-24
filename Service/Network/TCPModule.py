@@ -23,7 +23,9 @@ import queue
 
 
 def encodeLine(obj: dict) -> bytes:
-    return (json.dumps(obj, ensure_ascii=False) + "\n").encode("utf-8")
+    # DB에서 온 datetime 등 json 기본으로 못 바꾸는 값은 str()로 대체.
+    # (member.createdAt, orders.createdAt/paidAt 가 여기 걸림)
+    return (json.dumps(obj, ensure_ascii=False, default=str) + "\n").encode("utf-8")
 
 
 class JsonLineServer:
