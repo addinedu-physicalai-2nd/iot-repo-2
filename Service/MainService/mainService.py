@@ -28,12 +28,19 @@ NetworkManager 가 흡수해서 둘 다 ("board", 이름, msg) 로 올려준다.
 """
 
 import queue
+import sys
 import time
 from collections import deque
+from pathlib import Path
 
-from network.networkManager import NetworkManager
-from db.dbManager import DBManager
-from protocol import OrderStatus
+_SERVICE_DIR = Path(__file__).resolve().parent.parent   # Service/  (DB/, Network/ 가 여기 있음)
+_REPO_ROOT = _SERVICE_DIR.parent                         # 저장소 루트 (Library/ 가 여기 있음)
+sys.path.insert(0, str(_SERVICE_DIR))
+sys.path.insert(0, str(_REPO_ROOT))
+
+from Network.networkManager import NetworkManager
+from DB.dbManager import DBManager
+from Library.protocol import OrderStatus
 
 
 # 분배 보드 배출구에 담긴 상품 id 를 '순서대로'. startOrder 의 counts 3개가 이 순서다.
@@ -118,7 +125,7 @@ class MainService:
         self.activeOrderId: int | None = None
         self.activeSince: float = 0.0          # 출고 지시 시각 (ORDER_TIMEOUT 용)
 
-        # 픽업박스 상태. 픽업 보드(Serial)의 boxStatus 이벤트로 갱신된다.
+        # 픽업박스 상태. 픽업 보드(Serial)의 slotState 이벤트로 갱신된다.
         # slot -> orderId(사용중) / None(빔). 센서값이 실물 정본이다.
         self.slotOccupied: dict[int, int | None] = {n: None for n in range(1, SLOT_COUNT + 1)}
         self.network = NetworkManager(
@@ -260,7 +267,8 @@ class MainService:
            "reason": "timeout"}
         보고가 곧 '다음 주문 받을 수 있음' 이다(분배 모터 IR 센서가 위치를 보장).
         픽업 보드(Serial):
-          {"event": "boxStatus", "boxes": [1,0,0]} 픽업박스 3개 점유 상태
+          {"event": "slotState", "boardId": "pickup", "slot": 1, "occupied": true}
+          슬롯 하나가 바뀔 때마다 한 건씩 옴 (pickupBoard.ino 참조).
         """
         self.network.logComm("fromBoard", boardName, msg)
 
@@ -279,8 +287,8 @@ class MainService:
             self._pumpDispatch()
         elif event in ("boardConnected", "boardDisconnected"):
             self._onBoardLost(boardName, event)
-        elif event == "boxStatus":
-            self._onBoxStatus(msg.get("boxes", []))
+        elif event == "slotState":
+            self._onSlotState(msg.get("slot"), msg.get("occupied"))
         else:
             print(f"[CC] 미처리 보드 이벤트 ({boardName}): {msg}")
 
@@ -430,18 +438,19 @@ class MainService:
         self._onOrderFailed(orderId, {"reason": reason, "dispensed": None})
 
     # ── 픽업박스 센서 (픽업 보드, Serial) ────────────────────────
-    def _onBoxStatus(self, boxes: list[int]):
-        """픽업박스 3개의 점유 상태를 통째로 받는다. 1=물건 있음, 0=빔.
+    def _onSlotState(self, slot: int | None, occupied: bool | None):
+        """픽업박스 센서 하나의 점유 상태 변화. slot 은 1부터, occupied 는 물건 유무.
 
-        비었는데 서버는 주문이 들어있다고 알던 슬롯 = 손님이 찾아간 것.
+        pickupBoard.ino 가 슬롯이 바뀔 때마다 한 건씩 보낸다(3개를 한 번에
+        보내지 않음). 비었는데 서버는 주문이 들어있다고 알던 슬롯 = 손님이 찾아간 것.
         """
-        for index, occupied in enumerate(boxes[:SLOT_COUNT]):
-            slot = index + 1
-            held = self.slotOccupied.get(slot)
-            if not occupied and held is not None:
-                self._completePickup(slot)
-            elif occupied and held is None:
-                self.slotOccupied[slot] = -1      # 서버가 모르는 물건이 놓여 있음
+        if slot is None or occupied is None or slot not in self.slotOccupied:
+            return
+        held = self.slotOccupied.get(slot)
+        if not occupied and held is not None:
+            self._completePickup(slot)
+        elif occupied and held is None:
+            self.slotOccupied[slot] = -1      # 서버가 모르는 물건이 놓여 있음
         self._pumpDispatch()
 
     def _completePickup(self, slot: int):
