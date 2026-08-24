@@ -172,6 +172,16 @@ class MainService:
                 self.orders[o.orderId] = o
         print(f"[CC] 진행 중 주문 복구: {len(self.orders)}건")
 
+        # ★ 주문만 복구하고 슬롯 기록을 비워두면, 물건이 함에 남아 있어도
+        #   서버는 '빈 칸' 으로 안다. 그러면 손님이 꺼내가도 _completePickup 이
+        #   돌지 않아 키오스크가 완료 화면으로 넘어가지 못한다(또 그 칸에
+        #   다음 주문을 또 배정한다). 배정돼 있던 슬롯을 같이 되살린다.
+        for order in self.orders.values():
+            slot = order.assignedSlot
+            if slot in self.slotOccupied and order.status != OrderStatus.DONE:
+                self.slotOccupied[slot] = order.orderId
+                print(f"[CC] 슬롯 {slot} 복구: 주문 {order.orderId} ({order.status})")
+
     # ── TCP 요청 처리 → 응답은 해당 clientId 로 ─────────────────
     def _handleTcp(self, clientId: int, msg: dict):
         cmd = msg.get("cmd")
@@ -289,6 +299,9 @@ class MainService:
             self._onBoardLost(boardName, event)
         elif event == "slotState":
             self._onSlotState(msg.get("slot"), msg.get("occupied"))
+        elif "hello" in msg:
+            # 보드가 방금 부팅했다. 곧 자기 상태를 전부 보고해 온다.
+            print(f"[CC] 보드 인사: {msg.get('hello')}")
         else:
             print(f"[CC] 미처리 보드 이벤트 ({boardName}): {msg}")
 
@@ -439,29 +452,73 @@ class MainService:
 
     # ── 픽업박스 센서 (픽업 보드, Serial) ────────────────────────
     def _onSlotState(self, slot: int | None, occupied: bool | None):
-        """픽업박스 센서 하나의 점유 상태 변화. slot 은 1부터, occupied 는 물건 유무.
+        """픽업박스 센서 하나의 점유 상태. slot 은 1부터, occupied 는 물건 유무.
 
-        pickupBoard.ino 가 슬롯이 바뀔 때마다 한 건씩 보낸다(3개를 한 번에
-        보내지 않음). 비었는데 서버는 주문이 들어있다고 알던 슬롯 = 손님이 찾아간 것.
+        PickUpControlBoard.ino 가 슬롯이 바뀔 때마다 한 건씩 보내고, 부팅 직후와
+        getSlotState 요청에는 3칸을 전부 보낸다. 비었는데 서버는 주문이
+        들어있다고 알던 슬롯 = 손님이 찾아간 것.
+
+        ★ 손님이 꺼냈는데 키오스크가 안 돌아간다면 거의 이 함수다.
+          그래서 판단 근거(센서값 / 서버 기록)를 항상 찍는다.
         """
         if slot is None or occupied is None or slot not in self.slotOccupied:
+            print(f"[CC] slotState 무시: slot={slot} occupied={occupied} "
+                  f"(슬롯 번호는 1~{SLOT_COUNT})")
             return
+
         held = self.slotOccupied.get(slot)
-        if not occupied and held is not None:
-            self._completePickup(slot)
-        elif occupied and held is None:
-            self.slotOccupied[slot] = -1      # 서버가 모르는 물건이 놓여 있음
+        print(f"[CC] 슬롯 {slot} 센서: {'물건있음' if occupied else '비었음'} "
+              f"(서버 기록: {self._describeHeld(held)})")
+
+        if not occupied:
+            if held is None:
+                # 기록이 비었다 = 서버 재시작 등으로 매핑을 잃었을 수 있다.
+                # 이 슬롯을 배정받은 주문이 아직 살아 있으면 그게 정답이다.
+                held = self._orderIdBySlot(slot)
+                if held is not None:
+                    print(f"[CC] 슬롯 {slot} 기록이 비어 있었음 — 주문 {held} 로 복구")
+                    self.slotOccupied[slot] = held
+            if held is not None:
+                self._completePickup(slot)
+            else:
+                print(f"[CC] 슬롯 {slot} 은 원래 빈 칸 — 완료 처리할 주문 없음")
+        else:
+            if held is None:
+                # 배정 기록보다 센서가 먼저 올 수도 있으니 주문에서 한 번 찾아본다
+                found = self._orderIdBySlot(slot)
+                self.slotOccupied[slot] = found if found is not None else -1
+                if found is None:
+                    print(f"[CC] 슬롯 {slot} 에 서버가 모르는 물건이 놓임")
+
         self._pumpDispatch()
+
+    def _orderIdBySlot(self, slot: int) -> int | None:
+        """그 슬롯을 배정받아 아직 안 끝난 주문. slotOccupied 가 비었을 때의 안전망."""
+        for order in self.orders.values():
+            if (order.assignedSlot == slot
+                    and order.status in (OrderStatus.DISPATCHING, OrderStatus.PICKUP_READY)):
+                return order.orderId
+        return None
+
+    @staticmethod
+    def _describeHeld(held: int | None) -> str:
+        if held is None:
+            return "빈 칸"
+        if held == -1:
+            return "모르는 물건"
+        return f"주문 {held}"
 
     def _completePickup(self, slot: int):
         orderId = self.slotOccupied.get(slot)
         self.slotOccupied[slot] = None
         order = self.orders.get(orderId) if isinstance(orderId, int) else None
         if order is None:
+            print(f"[CC] 슬롯 {slot} 비워짐 (연결된 주문 없음)")
             self.network.broadcastTcp({"cmd": "slotReleased", "slot": slot})
             return
         order.setStatus(OrderStatus.DONE)
         order.releaseSlot()
+        print(f"[CC] 주문 {order.orderId} 픽업 완료 — 슬롯 {slot} 비움")
         self.network.broadcastTcp(
             {"cmd": "dispatchStatus", "orderId": order.orderId, "state": OrderStatus.DONE})
         self.network.broadcastTcp({"cmd": "slotReleased", "slot": slot})
