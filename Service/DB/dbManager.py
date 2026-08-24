@@ -9,11 +9,24 @@ SmartMart DB 접근 모듈 (MySQL, pymysql)
 """
 
 import os
+from pathlib import Path
+
 import pymysql
 from pymysql.cursors import DictCursor
 from dotenv import load_dotenv
 
-load_dotenv()
+_MODULE_DIR = Path(__file__).resolve().parent
+load_dotenv(_MODULE_DIR / ".env")   # cwd 와 무관하게 항상 이 파일 옆의 .env 를 읽는다
+
+_SCHEMA_PATH = _MODULE_DIR / "Schema.SQL"
+
+# orders 테이블 컬럼(snake_case) -> 서버가 쓰는 camelCase 로 alias.
+# mainService.Order.fromDbRow() 가 memberId/assignedSlot 키를 그대로 기대한다.
+_ORDER_SELECT = (
+    "SELECT id, member_id AS memberId, status, "
+    "assigned_slot AS assignedSlot, total_price AS totalPrice, "
+    "created_at AS createdAt, paid_at AS paidAt FROM orders "
+)
 
 
 class DBManager:
@@ -39,6 +52,24 @@ class DBManager:
             cursorclass=DictCursor,
             autocommit=True,
         )
+
+    def initDb(self):
+        """서버 기동 시 한 번 호출. Schema.SQL 을 그대로 실행해 DB/테이블이
+        없으면 만든다(CREATE ... IF NOT EXISTS 라 이미 있으면 그냥 넘어간다).
+        DB 자체가 없을 수 있어 database= 없이 접속한다."""
+        conn = pymysql.connect(
+            host=self.host, port=self.port, user=self.user,
+            password=self.password, charset="utf8mb4", autocommit=True,
+        )
+        try:
+            sql = _SCHEMA_PATH.read_text(encoding="utf-8")
+            with conn.cursor() as cur:
+                for statement in sql.split(";"):
+                    statement = statement.strip()
+                    if statement:
+                        cur.execute(statement)
+        finally:
+            conn.close()
 
     # ------------------------------------------------------------
     # member
@@ -219,7 +250,7 @@ class DBManager:
         conn = self._connect()
         try:
             with conn.cursor() as cur:
-                cur.execute("SELECT * FROM orders WHERE id = %s", (orderId,))
+                cur.execute(_ORDER_SELECT + "WHERE id = %s", (orderId,))
                 order = cur.fetchone()
                 if order is None:
                     return None
@@ -245,7 +276,7 @@ class DBManager:
         conn = self._connect()
         try:
             with conn.cursor() as cur:
-                sql = f"SELECT * FROM orders {whereClause} ORDER BY id DESC"
+                sql = _ORDER_SELECT + f"{whereClause} ORDER BY id DESC"
                 cur.execute(sql, params)
                 orders = cur.fetchall()
                 for order in orders:
@@ -257,7 +288,7 @@ class DBManager:
     def _getOrderItems(self, cur, orderId):
         """order_item + product 조인해서 품목 상세(이름, 가격 포함) 가져오기."""
         cur.execute(
-            "SELECT oi.product_id, oi.qty, p.name, p.price "
+            "SELECT oi.product_id AS productId, oi.qty, p.name, p.price "
             "FROM order_item oi JOIN product p ON oi.product_id = p.id "
             "WHERE oi.order_id = %s",
             (orderId,),

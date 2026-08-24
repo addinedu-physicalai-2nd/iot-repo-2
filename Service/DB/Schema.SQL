@@ -11,12 +11,7 @@ USE smartmart;
 -- ----------------------------------------------------------------------
 -- member
 -- ----------------------------------------------------------------------
-DROP TABLE IF EXISTS order_item;
-DROP TABLE IF EXISTS orders;
-DROP TABLE IF EXISTS product;
-DROP TABLE IF EXISTS member;
-
-CREATE TABLE member (
+CREATE TABLE IF NOT EXISTS member (
     id          INT AUTO_INCREMENT PRIMARY KEY,
     username    VARCHAR(32) NOT NULL,
     password    VARCHAR(32) NOT NULL,
@@ -30,7 +25,7 @@ CREATE TABLE member (
 -- ----------------------------------------------------------------------
 -- product
 -- ----------------------------------------------------------------------
-CREATE TABLE product (
+CREATE TABLE IF NOT EXISTS product (
     id      INT AUTO_INCREMENT PRIMARY KEY,
     name    VARCHAR(32) NOT NULL,
     price   INT NOT NULL,
@@ -38,14 +33,15 @@ CREATE TABLE product (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 
-CREATE TABLE orders (
+CREATE TABLE IF NOT EXISTS orders (
     id              INT AUTO_INCREMENT PRIMARY KEY,
     member_id       INT NOT NULL,
-    status          ENUM('대기', '결제완료', '출고중', '픽업대기', '완료')
+    status          ENUM('대기', '결제완료', '출고중', '픽업대기', '완료', '오류')
                         NOT NULL DEFAULT '대기',
     assigned_slot   INT NULL,
     total_price     INT NOT NULL,
     created_at      DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    paid_at         DATETIME NULL,
     CONSTRAINT fk_order_member
         FOREIGN KEY (member_id) REFERENCES member(id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
@@ -53,7 +49,7 @@ CREATE TABLE orders (
 -- ----------------------------------------------------------------------
 -- order_item
 -- ----------------------------------------------------------------------
-CREATE TABLE order_item (
+CREATE TABLE IF NOT EXISTS order_item (
     id          INT AUTO_INCREMENT PRIMARY KEY,
     order_id    INT NOT NULL,
     product_id  INT NOT NULL,

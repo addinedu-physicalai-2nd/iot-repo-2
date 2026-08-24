@@ -25,6 +25,12 @@ customerQt.py — 고객용 무인매장 키오스크 (PyQt6)
 
 import argparse
 import sys
+from pathlib import Path
+
+_UI_DIR = Path(__file__).resolve().parent.parent      # UI/  (theme.py, qtService.py 가 여기 있음)
+_REPO_ROOT = _UI_DIR.parent                             # 저장소 루트 (Library/ 가 여기 있음)
+sys.path.insert(0, str(_UI_DIR))
+sys.path.insert(0, str(_REPO_ROOT))
 
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QLabel, QPushButton, QFrame,
@@ -32,9 +38,9 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtCore import Qt, QTimer
 
-from protocol import OrderStatus
+from Library.protocol import OrderStatus
 from qtService import QtService
-from theme import (
+from UI.theme import (
     COL_BG, COL_PANEL, COL_PANEL_HDR, COL_SIDE_SEL, COL_TEXT,
     COL_SUBTLE, COL_LINE, COL_OK, COL_WARN, COL_DANGER,
 )

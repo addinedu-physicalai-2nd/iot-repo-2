@@ -29,9 +29,9 @@ network/networkManager.py — 통신 스레드 통합 관리
 import queue
 import time
 
-from network.TCPModule import QtServer, BoardHub
-from network.UDPModule import CamReceiver, FrameSender
-from network.serialModule import SerialHandler
+from Network.TCPModule import QtServer, BoardHub
+from Network.UDPModule import CamReceiver, FrameSender
+from Network.serialModule import SerialHandler
 
 
 # 보드 이름 -> 어떻게 붙었고(transport) 어떤 명령을 맡는가(commands)
