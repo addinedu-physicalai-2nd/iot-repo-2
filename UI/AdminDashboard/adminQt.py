@@ -45,7 +45,7 @@ from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QLabel, QPushButton, QFrame,
     QVBoxLayout, QHBoxLayout, QGridLayout, QTableWidget, QTableWidgetItem,
     QHeaderView, QListWidget, QListWidgetItem, QStackedWidget, QSizePolicy,
-    QAbstractItemView,
+    QAbstractItemView, QMessageBox,
 )
 from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtGui import QFont, QColor, QPixmap
@@ -372,6 +372,19 @@ class AdminDashboard(QMainWindow):
 
     def _panelOrderList(self) -> QFrame:
         frame, body = panel("주문 목록")
+
+        bar = QHBoxLayout()
+        bar.addStretch(1)
+        resetBtn = QPushButton("테스트 데이터 초기화")
+        resetBtn.setCursor(Qt.CursorShape.PointingHandCursor)
+        resetBtn.setStyleSheet(
+            f"QPushButton{{background:{COL_PANEL_HDR};color:{COL_DANGER};"
+            f"border:1px solid {COL_DANGER};border-radius:6px;padding:5px 14px;}}"
+            f"QPushButton:hover{{background:{COL_DANGER};color:white;}}")
+        resetBtn.clicked.connect(self._confirmResetTestData)
+        bar.addWidget(resetBtn)
+        body.addLayout(bar)
+
         table = QTableWidget(0, 5)
         table.setHorizontalHeaderLabels(["주문번호", "회원", "상태", "슬롯", "상품"])
         table.verticalHeader().setVisible(False)
@@ -794,6 +807,18 @@ class AdminDashboard(QMainWindow):
     def _scheduleResync(self):
         self._resyncTimer.start()   # 이미 돌고 있으면 타이머가 리셋됨(디바운스)
 
+    def _confirmResetTestData(self):
+        """개발/테스트 중 쌓인 주문·재고를 지운다. 실수로 누르면 안 되니 확인창을 띄운다."""
+        ok = QMessageBox.question(
+            self, "테스트 데이터 초기화",
+            "모든 주문 내역을 지우고 재고를 초기값으로 되돌립니다.\n"
+            "회원/상품 목록은 그대로 유지됩니다. 계속할까요?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if ok == QMessageBox.StandardButton.Yes:
+            self._net.send({"cmd": "resetTestData"})
+
     # ── 연결 상태 ────────────────────────────────────────────────
     def _onConnected(self):
         self._setServerStatus(True)
@@ -813,6 +838,7 @@ class AdminDashboard(QMainWindow):
             "productList":        self._hProductList,
             "memberList":         self._hMemberList,
             "updateStockResult": self._hUpdateStockResult,
+            "resetTestDataResult": self._hResetTestDataResult,
             # push (broadcast)
             "dispatchStatus":     self._hDispatchStatus,
             "pickupReady":        self._hPickupReady,
@@ -846,6 +872,14 @@ class AdminDashboard(QMainWindow):
             self._scheduleResync()
         else:
             self._addAlert("재고 수정 실패", COL_DANGER)
+
+    def _hResetTestDataResult(self, msg: dict):
+        if msg.get("success"):
+            self._orders.clear()
+            self._addAlert("테스트 데이터를 초기화했습니다", COL_OK)
+            self._requestRefresh()
+        else:
+            self._addAlert("테스트 데이터 초기화 실패", COL_DANGER)
 
     # ── push 핸들러 ──────────────────────────────────────────────
     def _hDispatchStatus(self, msg: dict):

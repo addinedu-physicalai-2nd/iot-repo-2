@@ -34,15 +34,19 @@ class DBManager:
     mainService에서 db = DBManager() 로 한 번만 만들어서 계속 재사용한다."""
 
     def __init__(self):
+        """RDS(원격) 연결을 여기서 바로 맺어서 계속 재사용한다.
+
+        호출마다 새로 열면 접속 핸드셰이크만으로 매번 1초 넘게 걸리는데,
+        그 비용을 첫 요청이 아니라 서버 기동 시점(DBManager() 생성)에 미리
+        치러둔다. ※ initDb() 로 스키마가 이미 만들어져 있어야 한다 — DB 자체가
+        없는 상태에서 여기서 바로 접속하면 Unknown database 에러가 난다.
+        """
         self.host = os.getenv("DB_HOST")
         self.port = int(os.getenv("DB_PORT", 3306))
         self.user = os.getenv("DB_USER")
         self.password = os.getenv("DB_PASSWORD")
         self.database = os.getenv("DB_NAME")
-
-    def _connect(self):
-        """호출할 때마다 새 연결을 하나 열어서 반환."""
-        return pymysql.connect(
+        self._conn = pymysql.connect(
             host=self.host,
             port=self.port,
             user=self.user,
@@ -53,10 +57,15 @@ class DBManager:
             autocommit=True,
         )
 
+    def _connect(self):
+        """살아있는 연결을 반환한다. 끊겼으면 ping(reconnect=True) 가 다시 연다."""
+        self._conn.ping(reconnect=True)
+        return self._conn
+
     def initDb(self):
         """서버 기동 시 한 번 호출. Schema.SQL 을 그대로 실행해 DB/테이블이
         없으면 만든다(CREATE ... IF NOT EXISTS 라 이미 있으면 그냥 넘어간다).
-        DB 자체가 없을 수 있어 database= 없이 접속한다."""
+        DB 자체가 없을 수 있어 database= 없이 별도 연결로 접속한다."""
         conn = pymysql.connect(
             host=self.host, port=self.port, user=self.user,
             password=self.password, charset="utf8mb4", autocommit=True,
@@ -78,48 +87,39 @@ class DBManager:
     def createMember(self, username, password, name="", contact=""):
         """회원가입. 성공하면 (True, memberId), 아이디 중복이면 (False, None)."""
         conn = self._connect()
-        try:
-            with conn.cursor() as cur:
-                try:
-                    cur.execute(
-                        "INSERT INTO member (username, password, name, contact) "
-                        "VALUES (%s, %s, %s, %s)",
-                        (username, password, name, contact),
-                    )
-                    return True, cur.lastrowid
-                except pymysql.err.IntegrityError:
-                    return False, None
-        finally:
-            conn.close()
+        with conn.cursor() as cur:
+            try:
+                cur.execute(
+                    "INSERT INTO member (username, password, name, contact) "
+                    "VALUES (%s, %s, %s, %s)",
+                    (username, password, name, contact),
+                )
+                return True, cur.lastrowid
+            except pymysql.err.IntegrityError:
+                return False, None
 
     def login(self, username, password):
         """로그인 확인. 성공하면 member 정보(dict), 실패하면 None.
         비밀번호(password)와 연락처(contact)는 빼고 돌려줌."""
         conn = self._connect()
-        try:
-            with conn.cursor() as cur:
-                cur.execute(
-                    "SELECT id, username, name, is_admin, created_at "
-                    "FROM member WHERE username = %s AND password = %s",
-                    (username, password),
-                )
-                row = cur.fetchone()
-                return self._memberToDict(row) if row else None
-        finally:
-            conn.close()
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT id, username, name, is_admin, created_at "
+                "FROM member WHERE username = %s AND password = %s",
+                (username, password),
+            )
+            row = cur.fetchone()
+            return self._memberToDict(row) if row else None
 
     def getMembers(self):
         """전체 회원 목록. 여기도 password/contact는 뺌."""
         conn = self._connect()
-        try:
-            with conn.cursor() as cur:
-                cur.execute(
-                    "SELECT id, username, name, is_admin, created_at FROM member"
-                )
-                rows = cur.fetchall()
-                return [self._memberToDict(row) for row in rows]
-        finally:
-            conn.close()
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT id, username, name, is_admin, created_at FROM member"
+            )
+            rows = cur.fetchall()
+            return [self._memberToDict(row) for row in rows]
 
     def _memberToDict(self, row):
         """DB 컬럼을 서버가 쓰는 Dic으로 바꿔줌."""
@@ -138,30 +138,24 @@ class DBManager:
     def getProducts(self):
         """상품 목록 전체."""
         conn = self._connect()
-        try:
-            with conn.cursor() as cur:
-                cur.execute("SELECT * FROM product ORDER BY id")
-                return cur.fetchall()
-        finally:
-            conn.close()
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM product ORDER BY id")
+            return cur.fetchall()
 
     def updateStock(self, productId, newStock):
         """재고 직접 수정 (관리자용). 없는 상품이거나 음수면 False."""
         if newStock < 0:
             return False
         conn = self._connect()
-        try:
-            with conn.cursor() as cur:
-                cur.execute("SELECT id FROM product WHERE id = %s", (productId,))
-                if cur.fetchone() is None:
-                    return False
-                cur.execute(
-                    "UPDATE product SET stock = %s WHERE id = %s",
-                    (newStock, productId),
-                )
-                return True
-        finally:
-            conn.close()
+        with conn.cursor() as cur:
+            cur.execute("SELECT id FROM product WHERE id = %s", (productId,))
+            if cur.fetchone() is None:
+                return False
+            cur.execute(
+                "UPDATE product SET stock = %s WHERE id = %s",
+                (newStock, productId),
+            )
+            return True
 
     # ------------------------------------------------------------
     # orders (핵심)
@@ -178,86 +172,74 @@ class DBManager:
             return False, None, None
 
         conn = self._connect()
-        try:
-            with conn.cursor() as cur:
-                total = 0
+        with conn.cursor() as cur:
+            total = 0
 
-                # 1단계: 재고 확인만 (아직 아무것도 안 바꿈)
-                for item in items:
-                    cur.execute(
-                        "SELECT price, stock FROM product WHERE id = %s",
-                        (item["productId"],),
-                    )
-                    product = cur.fetchone()
-                    if product is None or product["stock"] < item["qty"]:
-                        return False, None, None
-                    total += product["price"] * item["qty"]
-
-                # 2단계: 전부 통과했으니 재고 차감
-                for item in items:
-                    cur.execute(
-                        "UPDATE product SET stock = stock - %s WHERE id = %s",
-                        (item["qty"], item["productId"]),
-                    )
-
-                # 3단계: 주문 헤더 생성
+            # 1단계: 재고 확인만 (아직 아무것도 안 바꿈)
+            for item in items:
                 cur.execute(
-                    "INSERT INTO orders (member_id, status, total_price) "
-                    "VALUES (%s, '대기', %s)",
-                    (memberId, total),
+                    "SELECT price, stock FROM product WHERE id = %s",
+                    (item["productId"],),
                 )
-                orderId = cur.lastrowid
+                product = cur.fetchone()
+                if product is None or product["stock"] < item["qty"]:
+                    return False, None, None
+                total += product["price"] * item["qty"]
 
-                # 4단계: 주문 품목들 생성
-                for item in items:
-                    cur.execute(
-                        "INSERT INTO order_item (order_id, product_id, qty) "
-                        "VALUES (%s, %s, %s)",
-                        (orderId, item["productId"], item["qty"]),
-                    )
+            # 2단계: 전부 통과했으니 재고 차감
+            for item in items:
+                cur.execute(
+                    "UPDATE product SET stock = stock - %s WHERE id = %s",
+                    (item["qty"], item["productId"]),
+                )
 
-                return True, orderId, total
-        finally:
-            conn.close()
+            # 3단계: 주문 헤더 생성
+            cur.execute(
+                "INSERT INTO orders (member_id, status, total_price) "
+                "VALUES (%s, '대기', %s)",
+                (memberId, total),
+            )
+            orderId = cur.lastrowid
+
+            # 4단계: 주문 품목들 생성
+            for item in items:
+                cur.execute(
+                    "INSERT INTO order_item (order_id, product_id, qty) "
+                    "VALUES (%s, %s, %s)",
+                    (orderId, item["productId"], item["qty"]),
+                )
+
+            return True, orderId, total
 
     def confirmPayment(self, orderId):
-        """결제 확정 표시 (paidAt 기록). 재고는 createOrder에서 이미 처리했음."""
+        """결제 확정 표시 (paidAt 기록 + status). 재고는 createOrder에서 이미 처리했음."""
         conn = self._connect()
-        try:
-            with conn.cursor() as cur:
-                cur.execute(
-                    "UPDATE orders SET paid_at = NOW(), status = '결제완료' "
-                    "WHERE id = %s",
-                    (orderId,),
-                )
-        finally:
-            conn.close()
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE orders SET paid_at = NOW(), status = '결제완료' "
+                "WHERE id = %s",
+                (orderId,),
+            )
 
     def updateOrderStatus(self, orderId, status):
         """주문 상태 변경."""
         conn = self._connect()
-        try:
-            with conn.cursor() as cur:
-                cur.execute(
-                    "UPDATE orders SET status = %s WHERE id = %s",
-                    (status, orderId),
-                )
-        finally:
-            conn.close()
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE orders SET status = %s WHERE id = %s",
+                (status, orderId),
+            )
 
     def getOrder(self, orderId):
         """주문 하나 상세 조회 (품목 포함). 없으면 None."""
         conn = self._connect()
-        try:
-            with conn.cursor() as cur:
-                cur.execute(_ORDER_SELECT + "WHERE id = %s", (orderId,))
-                order = cur.fetchone()
-                if order is None:
-                    return None
-                order["items"] = self._getOrderItems(cur, orderId)
-                return order
-        finally:
-            conn.close()
+        with conn.cursor() as cur:
+            cur.execute(_ORDER_SELECT + "WHERE id = %s", (orderId,))
+            order = cur.fetchone()
+            if order is None:
+                return None
+            order["items"] = self._getOrderItems(cur, orderId)
+            return order
 
     def getOrdersByMember(self, memberId):
         """회원별 주문 이력."""
@@ -274,16 +256,13 @@ class DBManager:
     def _listOrders(self, whereClause, params):
         """getOrdersByMember/ByStatus/getAllOrders가 공통으로 쓰는 내부 함수."""
         conn = self._connect()
-        try:
-            with conn.cursor() as cur:
-                sql = _ORDER_SELECT + f"{whereClause} ORDER BY id DESC"
-                cur.execute(sql, params)
-                orders = cur.fetchall()
-                for order in orders:
-                    order["items"] = self._getOrderItems(cur, order["id"])
-                return orders
-        finally:
-            conn.close()
+        with conn.cursor() as cur:
+            sql = _ORDER_SELECT + f"{whereClause} ORDER BY id DESC"
+            cur.execute(sql, params)
+            orders = cur.fetchall()
+            for order in orders:
+                order["items"] = self._getOrderItems(cur, order["id"])
+            return orders
 
     def _getOrderItems(self, cur, orderId):
         """order_item + product 조인해서 품목 상세(이름, 가격 포함) 가져오기."""
@@ -302,42 +281,54 @@ class DBManager:
     def findFreeSlot(self):
         """빈 슬롯 번호(1~3) 찾기. 다 차면 None."""
         conn = self._connect()
-        try:
-            with conn.cursor() as cur:
-                cur.execute(
-                    "SELECT assigned_slot FROM orders WHERE assigned_slot IS NOT NULL"
-                )
-                occupied = {row["assigned_slot"] for row in cur.fetchall()}
-                for slot in (1, 2, 3):
-                    if slot not in occupied:
-                        return slot
-                return None
-        finally:
-            conn.close()
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT assigned_slot FROM orders WHERE assigned_slot IS NOT NULL"
+            )
+            occupied = {row["assigned_slot"] for row in cur.fetchall()}
+            for slot in (1, 2, 3):
+                if slot not in occupied:
+                    return slot
+            return None
 
     def assignSlot(self, orderId, slot):
         """주문에 픽업 슬롯 배정."""
         conn = self._connect()
-        try:
-            with conn.cursor() as cur:
-                cur.execute(
-                    "UPDATE orders SET assigned_slot = %s WHERE id = %s",
-                    (slot, orderId),
-                )
-        finally:
-            conn.close()
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE orders SET assigned_slot = %s WHERE id = %s",
+                (slot, orderId),
+            )
 
     def releaseSlot(self, slot):
         """픽업 완료 시 슬롯 해제."""
         conn = self._connect()
-        try:
-            with conn.cursor() as cur:
-                cur.execute(
-                    "UPDATE orders SET assigned_slot = NULL WHERE assigned_slot = %s",
-                    (slot,),
-                )
-        finally:
-            conn.close()
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE orders SET assigned_slot = NULL WHERE assigned_slot = %s",
+                (slot,),
+            )
+
+    # ------------------------------------------------------------
+    # 테스트용
+    # ------------------------------------------------------------
+
+    def resetTestData(self, defaultStock=20):
+        """개발/테스트 중 쌓인 주문을 지우고 재고를 defaultStock 으로 되돌린다.
+        member/product 는 안 건드림."""
+        conn = self._connect()
+        with conn.cursor() as cur:
+            cur.execute("SET FOREIGN_KEY_CHECKS = 0")
+            cur.execute("TRUNCATE TABLE order_item")
+            cur.execute("TRUNCATE TABLE orders")
+            cur.execute("SET FOREIGN_KEY_CHECKS = 1")
+            cur.execute("UPDATE product SET stock = %s", (defaultStock,))
+
+    def close(self):
+        """서버 종료 시 정리용. 평소엔 연결을 계속 들고 있는 게 정상이다."""
+        if self._conn is not None:
+            self._conn.close()
+            self._conn = None
 
 
 if __name__ == "__main__":

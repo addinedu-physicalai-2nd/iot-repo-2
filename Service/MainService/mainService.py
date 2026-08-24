@@ -182,6 +182,17 @@ class MainService:
                 self.slotOccupied[slot] = order.orderId
                 print(f"[CC] 슬롯 {slot} 복구: 주문 {order.orderId} ({order.status})")
 
+    # ── 테스트 데이터 초기화 (resetTestData) ─────────────────────
+    def _resetRuntimeState(self):
+        """DB 를 비운 직후, 메모리에 남아있는 주문/출고 상태도 같이 비운다."""
+        self.orders.clear()
+        self.waitingOrders.clear()
+        self.boardReady = True
+        self.activeOrderId = None
+        self.activeSince = 0.0
+        self.slotOccupied = {n: None for n in range(1, SLOT_COUNT + 1)}
+        print("[CC] 테스트 데이터 초기화 완료")
+
     # ── TCP 요청 처리 → 응답은 해당 clientId 로 ─────────────────
     def _handleTcp(self, clientId: int, msg: dict):
         cmd = msg.get("cmd")
@@ -220,7 +231,7 @@ class MainService:
             order = self.orders.get(orderId)
             if order:  # TODO: 실제 결제 처리
                 self.db.confirmPayment(orderId)
-                order.setStatus(OrderStatus.PAID)
+                order.status = OrderStatus.PAID  # confirmPayment 가 이미 DB 에 반영함 — 다시 쓸 필요 없음
                 resp = {"cmd": "paymentResult", "orderId": orderId,
                         "status": "success"}
                 # 보드가 비어 있으면 바로 보내고, 처리 중이면 대기열에 세운다
@@ -259,6 +270,12 @@ class MainService:
             ok = self.db.updateStock(msg["productId"], msg["newStock"])
             resp = {"cmd": "updateStockResult", "success": ok}
 
+        elif cmd == "resetTestData":
+            self.db.resetTestData()
+            self._resetRuntimeState()
+            resp = {"cmd": "resetTestDataResult", "success": True}
+            self.network.broadcastTcp({"cmd": "allOrdersData", "orders": []})
+
         else:
             resp = {"cmd": "error", "reason": f"unknownCmd:{cmd}"}
 
@@ -278,7 +295,7 @@ class MainService:
         보고가 곧 '다음 주문 받을 수 있음' 이다(분배 모터 IR 센서가 위치를 보장).
         픽업 보드(Serial):
           {"event": "slotState", "boardId": "pickup", "slot": 1, "occupied": true}
-          슬롯 하나가 바뀔 때마다 한 건씩 옴 (pickupBoard.ino 참조).
+          슬롯 하나가 바뀔 때마다 한 건씩 옴 (PickUpControlBoard.ino 참조).
         """
         self.network.logComm("fromBoard", boardName, msg)
 
