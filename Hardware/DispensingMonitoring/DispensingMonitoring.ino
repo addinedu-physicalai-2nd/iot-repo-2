@@ -4,7 +4,7 @@
 
 const char* WIFI_SSID     = "addinedu_201class_2-2.4G";
 const char* WIFI_PASSWORD = "201class2!";
-const char* SERVER_IP     = "192.168.0.132";
+const char* SERVER_IP     = "192.168.0.225";
 const int   SERVER_PORT   = 6001;  // mainService.py camPorts["dispensing"] 와 일치
 
 const int CHUNK_SIZE = 1200;  // 패킷 하나당 최대 데이터 크기 (헤더 제외)

@@ -5,7 +5,7 @@
 
 const char* wifiSsid = "addinedu_201class_2-2.4G";
 const char* wifiPassword = "201class2!";
-const char* serverIp = "192.168.0.131";
+const char* serverIp = "192.168.0.225";
 const uint16_t serverPort = 9002;
 
 
