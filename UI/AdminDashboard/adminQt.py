@@ -176,7 +176,7 @@ class VideoView(QLabel):
 
 
 class AdminDashboard(QMainWindow):
-    def __init__(self, host: str = "127.0.0.1", port: int = 9000):
+    def __init__(self, host: str = "192.168.0.225", port: int = 9000):
         super().__init__()
         self.setWindowTitle("SmartMart — 무인매장 관리 시스템")
         self.resize(1080, 720)
@@ -958,7 +958,7 @@ class AdminDashboard(QMainWindow):
 
 def main():
     ap = argparse.ArgumentParser(description="SmartMart 관리자 대시보드")
-    ap.add_argument("--host", default="127.0.0.1", help="centralControl 서버 주소")
+    ap.add_argument("--host", default="192.168.0.225", help="centralControl 서버 주소")
     ap.add_argument("--port", type=int, default=9000, help="제어 TCP 포트 (기본 9000)")
     args = ap.parse_args()
 
