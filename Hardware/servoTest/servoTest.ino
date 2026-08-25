@@ -12,7 +12,7 @@ Servo servos[4]; // 0,1,2 = 배출서보1~3, 3 = 슬롯서보
 
 int currentAngle[4] = {0, 0, 180, 90}; // 서보별 현재 각도
 int targetAngle[4] = {0, 0, 0, 0};  // ㄴ서보별 목표 각도
-int homeAngle[4] = {0, 0, 180, 90};
+int homeAngle[4] = {5, 0, 180, 98}; // {1번 서보, 2번 서보, 3번 서보, 4번 서보} 서보 초기값 세팅
 bool servoMoving[4] = {false, false, false, false};
 
 unsigned long lastStepTime[4] = {0, 0, 0, 0};
