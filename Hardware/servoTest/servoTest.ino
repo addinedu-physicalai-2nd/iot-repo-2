@@ -10,8 +10,9 @@ Stepper myStepper(stepsPerRevolution, 23, 21, 22, 19);
 
 Servo servos[4]; // 0,1,2 = 배출서보1~3, 3 = 슬롯서보
 
-int currentAngle[4] = {0, 0, 0, 0}; // 서보별 현재 각도
-int targetAngle[4] = {0, 0, 0, 0};  // 서보별 목표 각도
+int currentAngle[4] = {0, 0, 180, 90}; // 서보별 현재 각도
+int targetAngle[4] = {0, 0, 0, 0};  // ㄴ서보별 목표 각도
+int homeAngle[4] = {0, 0, 180, 90};
 bool servoMoving[4] = {false, false, false, false};
 
 unsigned long lastStepTime[4] = {0, 0, 0, 0};
@@ -44,7 +45,7 @@ void setup()
 
   for (int i = 0; i < 4; i++)
   {
-    servos[i].write(0);
+    servos[i].write(homeAngle[i]);
   }
 
   Serial.println("=== 서보 4개 개별 테스트 (천천히 이동) ===");
@@ -86,7 +87,6 @@ void loop()
       inputBuffer += c;
     }
   }
-
   // 서보 4개를 각각 비차단으로 천천히 이동
   for (int i = 0; i < 4; i++)
   {
