@@ -40,7 +40,7 @@ sys.path.insert(0, str(_REPO_ROOT))
 
 from Network.networkManager import NetworkManager
 from DB.dbManager import DBManager
-from Library.protocol import OrderStatus
+from Library.protocol import OrderStatus, FailReason
 
 
 # 분배 보드 배출구에 담긴 상품 id 를 '순서대로'. startOrder 의 counts 3개가 이 순서다.
@@ -291,7 +291,7 @@ class MainService:
         분배 보드(WiFi):
           {"event": "orderComplete", "orderId": 101, "dispensed": [2,1,0]}
           {"event": "orderFailed",   "orderId": 101, "dispensed": [2,0,0],
-           "reason": "timeout"}
+           "reason": "jam"}          reason 값은 Library.protocol.FailReason
         보고가 곧 '다음 주문 받을 수 있음' 이다(분배 모터 IR 센서가 위치를 보장).
         픽업 보드(Serial):
           {"event": "slotState", "boardId": "pickup", "slot": 1, "occupied": true}
@@ -398,7 +398,7 @@ class MainService:
         if not order:
             return
         order.setStatus(OrderStatus.ERROR)
-        reason = msg.get("reason", "unknown")
+        reason = msg.get("reason", FailReason.UNKNOWN)
         print(f"[CC] 주문 {orderId} 출고 실패: {reason} (배출 {msg.get('dispensed')})")
         # 선점했던 슬롯을 되돌린다
         slot = order.assignedSlot
@@ -438,7 +438,7 @@ class MainService:
         # 출고 지시 후 아무 보고도 없다 → 보드가 뻗었거나 잼. 주문을 놓아준다.
         if self.activeOrderId is not None and now - self.activeSince > ORDER_TIMEOUT:
             print(f"[CC] 보드 무응답 {ORDER_TIMEOUT:.0f}초 — 주문 정리")
-            self._failActiveOrder("boardTimeout")
+            self._failActiveOrder(FailReason.BOARD_TIMEOUT)
             self.boardReady = True
             self._pumpDispatch()
 
@@ -452,7 +452,7 @@ class MainService:
         if boardName != self.network.boardFor("startOrder"):
             return
         if self.activeOrderId is not None:
-            self._failActiveOrder("boardReset")
+            self._failActiveOrder(FailReason.BOARD_RESET)
         if event == "boardDisconnected":
             self.boardReady = False      # 없는 보드에 주문을 밀어넣지 않는다
         else:

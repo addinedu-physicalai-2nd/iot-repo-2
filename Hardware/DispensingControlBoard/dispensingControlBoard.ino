@@ -1,7 +1,35 @@
 #include <WiFi.h>
-#include <ArduinoJson.h>
 #include <Stepper.h>
 #include <ESP32Servo.h>
+
+/*
+  서버(:9002)와의 통신은 바이너리 프레임이다.  ★ Library/protocol.py 와 반드시 같아야 함
+
+      [ TAG (ASCII 2바이트) ][ PAYLOAD (태그마다 길이 고정) ]
+
+  길이 필드가 없다. 태그를 보면 뒤에 몇 바이트가 오는지 알 수 있기 때문이다.
+  숫자는 빅엔디안(네트워크 바이트 순서), orderId 만 2바이트고 나머지는 1바이트.
+
+    서버 → 보드
+      SO  startOrder      orderId(2) counts(3) slot(1)       = 6
+    보드 → 서버
+      HL  hello           (없음)                              = 0
+      OC  orderComplete   orderId(2) dispensed(3)             = 5
+      OF  orderFailed     orderId(2) dispensed(3) reason(1)   = 6
+      OR  orderRejected   orderId(2) reason(1)                = 3
+*/
+#define TAG_SIZE 2
+#define PAYLOAD_START_ORDER 6
+#define PAYLOAD_ORDER_COMPLETE 5
+#define PAYLOAD_ORDER_FAILED 6
+#define PAYLOAD_ORDER_REJECTED 3
+
+// reason 코드 — protocol.py 의 FAIL_REASON_CODE 와 같은 값
+#define REASON_UNKNOWN 0x00
+#define REASON_JAM 0x01
+#define REASON_BOARD_TIMEOUT 0x02
+#define REASON_BOARD_RESET 0x03
+#define REASON_BUSY 0x04
 
 const char* wifiSsid = "addinedu_201class_2-2.4G";
 const char* wifiPassword = "201class2!";
@@ -10,7 +38,11 @@ const uint16_t serverPort = 9002;
 
 
 WiFiClient client;
-String rxBuffer = "";
+
+// 수신 버퍼. 프레임 하나는 최대 8B(태그2+페이로드6)지만, 조각나서 오거나
+// 여러 개가 붙어 와도 담기게 넉넉히 잡는다.
+uint8_t rxBuf[32];
+uint8_t rxLen = 0;
 
 #define servo1Pin 16
 #define servo2Pin 17
@@ -78,20 +110,30 @@ void connectWiFi()
   Serial.println("\nWi-Fi 연결됨: " + WiFi.localIP().toString());
 }
 
-void sendJson(JsonDocument& doc)
+// 태그 + 페이로드를 한 번에 write 한다(두 번 나눠 쓰면 세그먼트가 갈려
+// 지연만 늘어난다). 서버는 스트림을 다시 붙이지만 굳이 쪼갤 이유가 없다.
+void sendFrame(const char* tag, const uint8_t* payload, uint8_t len)
 {
-  String out;
-  serializeJson(doc, out);
-  client.println(out);
-  Serial.print("[보낸 메시지] ");
-  Serial.println(out);
+  uint8_t frame[TAG_SIZE + 6];
+  frame[0] = (uint8_t)tag[0];
+  frame[1] = (uint8_t)tag[1];
+  for (uint8_t i = 0; i < len; i++)
+  {
+    frame[TAG_SIZE + i] = payload[i];
+  }
+  client.write(frame, TAG_SIZE + len);
+  Serial.printf("[보낸 프레임] %c%c (%u바이트)\n", tag[0], tag[1], len);
+}
+
+// orderId 는 uint16. 아직 주문이 없을 때(-1)는 0 으로 내보낸다.
+uint16_t safeOrderId()
+{
+  return (currentOrderId < 0) ? 0 : (uint16_t)currentOrderId;
 }
 
 void sendHello()
 {
-  StaticJsonDocument<64> doc;
-  doc["hello"] = "dispenser";
-  sendJson(doc);
+  sendFrame("HL", nullptr, 0);
 }
 
 void connectServer()
@@ -112,36 +154,33 @@ void connectServer()
 
 void sendOrderComplete()
 {
-  StaticJsonDocument<192> doc;
-  doc["event"] = "orderComplete";
-  doc["orderId"] = currentOrderId;
-  JsonArray arr = doc.createNestedArray("dispensed");
-  arr.add(dispensedByType[0]);
-  arr.add(dispensedByType[1]);
-  arr.add(dispensedByType[2]);
-  sendJson(doc);
+  uint16_t id = safeOrderId();
+  uint8_t payload[PAYLOAD_ORDER_COMPLETE] = {
+      (uint8_t)(id >> 8), (uint8_t)(id & 0xFF),
+      (uint8_t)dispensedByType[0],
+      (uint8_t)dispensedByType[1],
+      (uint8_t)dispensedByType[2]};
+  sendFrame("OC", payload, PAYLOAD_ORDER_COMPLETE);
 }
 
-void sendOrderFailed(const char* reason)
+void sendOrderFailed(uint8_t reason)
 {
-  StaticJsonDocument<192> doc;
-  doc["event"] = "orderFailed";
-  doc["orderId"] = currentOrderId;
-  JsonArray arr = doc.createNestedArray("dispensed");
-  arr.add(dispensedByType[0]);
-  arr.add(dispensedByType[1]);
-  arr.add(dispensedByType[2]);
-  doc["reason"] = reason;
-  sendJson(doc);
+  uint16_t id = safeOrderId();
+  uint8_t payload[PAYLOAD_ORDER_FAILED] = {
+      (uint8_t)(id >> 8), (uint8_t)(id & 0xFF),
+      (uint8_t)dispensedByType[0],
+      (uint8_t)dispensedByType[1],
+      (uint8_t)dispensedByType[2],
+      reason};
+  sendFrame("OF", payload, PAYLOAD_ORDER_FAILED);
 }
 
-void sendOrderRejected(int orderId)
+void sendOrderRejected(uint16_t orderId)
 {
-  StaticJsonDocument<128> doc;
-  doc["event"] = "orderRejected";
-  doc["orderId"] = orderId;
-  doc["reason"] = "busy";
-  sendJson(doc);
+  uint8_t payload[PAYLOAD_ORDER_REJECTED] = {
+      (uint8_t)(orderId >> 8), (uint8_t)(orderId & 0xFF),
+      REASON_BUSY};
+  sendFrame("OR", payload, PAYLOAD_ORDER_REJECTED);
 }
 
 // ── 서보 이동 (비차단) ──────────────────────────────────
@@ -216,44 +255,72 @@ void handleStartOrder(int orderId, int c0, int c1, int c2, int slot)
 
 // ── 서버 메시지 처리 ─────────────────────────────────────
 
-void handleIncomingLine(String line)
+// 이 보드가 받는 명령은 SO(startOrder) 하나뿐이다.
+// 아는 태그면 페이로드 길이를, 모르는 태그면 -1 을 돌려준다.
+int payloadLenFor(const uint8_t* tag)
 {
-  Serial.print("[받은 메시지] ");
-  Serial.println(line);
-
-  StaticJsonDocument<256> doc;
-  DeserializationError err = deserializeJson(doc, line);
-  if (err)
+  if (tag[0] == 'S' && tag[1] == 'O')
   {
-    Serial.print("JSON 파싱 실패: ");
-    Serial.println(err.c_str());
-    return;
+    return PAYLOAD_START_ORDER;
   }
+  return -1;
+}
 
-  const char* cmd = doc["cmd"];
-  Serial.print("cmd 값: ");
-  Serial.println(cmd ? cmd : "(없음)");
+void handleStartOrderFrame(const uint8_t* payload)
+{
+  uint16_t orderId = ((uint16_t)payload[0] << 8) | payload[1];
+  int c0 = payload[2];
+  int c1 = payload[3];
+  int c2 = payload[4];
+  int slot = payload[5];
 
-  if (cmd != nullptr && strcmp(cmd, "startOrder") == 0)
+  Serial.printf("startOrder 수신: orderId=%u, counts=[%d,%d,%d], slot=%d\n",
+                orderId, c0, c1, c2, slot);
+
+  if (dispenseState == idle && !conveyorRunning)
   {
-    int orderId = doc["orderId"];
-    JsonArray counts = doc["counts"];
-    int c0 = counts[0];
-    int c1 = counts[1];
-    int c2 = counts[2];
-    int slot = doc["slot"];
+    handleStartOrder(orderId, c0, c1, c2, slot);
+  }
+  else
+  {
+    Serial.println("바쁨 상태라 명령 거절됨");
+    sendOrderRejected(orderId);
+  }
+}
 
-    Serial.printf("startOrder 파싱됨: orderId=%d, counts=[%d,%d,%d], slot=%d\n",
-                  orderId, c0, c1, c2, slot);
-
-    if (dispenseState == idle && !conveyorRunning)
+// 받은 바이트를 모아 프레임 단위로 잘라낸다.
+// TCP 는 스트림이라 프레임이 쪼개져 오거나 여러 개가 붙어 온다.
+// 예전 '\n' 자르기가 하던 일을 이게 대신한다.
+void readServerFrames()
+{
+  while (client.available())
+  {
+    if (rxLen >= sizeof(rxBuf))
     {
-      handleStartOrder(orderId, c0, c1, c2, slot);
+      Serial.println("수신 버퍼 넘침 — 비우고 재동기화");
+      rxLen = 0;
     }
-    else
+    rxBuf[rxLen++] = (uint8_t)client.read();
+
+    while (rxLen >= TAG_SIZE)
     {
-      Serial.println("바쁨 상태라 명령 거절됨");
-      sendOrderRejected(orderId);
+      int need = payloadLenFor(rxBuf);
+      if (need < 0)
+      {
+        // 모르는 태그 = 스트림 어긋남. 구분자가 없으니 1바이트씩 버리며
+        // 다시 맞춘다(그대로 두면 영영 못 읽는다).
+        rxLen--;
+        memmove(rxBuf, rxBuf + 1, rxLen);
+        continue;
+      }
+      if (rxLen < TAG_SIZE + need)
+      {
+        break;                       // 페이로드가 아직 덜 왔다
+      }
+      handleStartOrderFrame(rxBuf + TAG_SIZE);
+      uint8_t used = TAG_SIZE + need;
+      rxLen -= used;
+      memmove(rxBuf, rxBuf + used, rxLen);
     }
   }
 }
@@ -316,22 +383,7 @@ void loop()
 
   updateServos();
 
-  while (client.available())
-  {
-    char c = client.read();
-    if (c == '\n' || c == '\r')
-    {
-      if (rxBuffer.length() > 0)
-      {
-        handleIncomingLine(rxBuffer);
-        rxBuffer = "";
-      }
-    }
-    else
-    {
-      rxBuffer += c;
-    }
-  }
+  readServerFrames();
 
   int currentServo = dispenseQueue[queueIndex];
 
@@ -386,7 +438,7 @@ void loop()
     waitingForSensor = false;
     conveyorRunning = false;
     Serial.println("잼(jam) 감지: 타임아웃 도달");
-    sendOrderFailed("jam");
+    sendOrderFailed(REASON_JAM);
     currentOrderId = -1;
   }
 
