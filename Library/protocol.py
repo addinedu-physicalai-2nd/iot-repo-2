@@ -12,4 +12,4 @@ class OrderStatus:
     DISPATCHING = "출고중"     # 분배 보드에 출고 지시함
     PICKUP_READY = "픽업대기"   # 출고 완료, 픽업박스에서 대기 중
     DONE = "완료"              # 손님이 픽업박스에서 찾아감
-    ERROR = "오류"             # 출고 실패/보드 무응답 등. Schema.SQL ENUM에는 아직 없음
+    ERROR = "오류"             # 출고 실패/보드 무응답 등
