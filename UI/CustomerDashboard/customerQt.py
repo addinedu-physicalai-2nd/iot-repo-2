@@ -5,20 +5,23 @@ customerQt.py — 고객용 무인매장 키오스크 (PyQt6)
   관리자 화면과 같은 서비스를 쓰되, 영상은 쓰지 않아 제어 채널만 연다.
 
 화면 흐름:
-  0. 상품 선택 → 수량 담기 → [주문하기]
-  1. 결제      → [카드 결제]
-  2. 진행/완료 → 출고중 … "N번 함에서 찾아가세요" … 감사합니다 → 처음으로
+  0. 카드 태그  → [카드 태그하기]  (상품 고르기 전에 먼저 태그 — cardUid 확보)
+  1. 상품 선택 → 수량 담기 → [주문하기]
+  2. 결제      → [카드 결제]        (여기서 같은 카드를 다시 태그해서 확인+차감)
+  3. 진행/완료 → 출고중 … "N번 함에서 찾아가세요" … 감사합니다 → 처음(카드 태그)으로
 
-주고받는 명령 (CLAUDE.md 프로토콜):
+주고받는 명령:
+  → tagCard        ← cardTagResult (성공 시 cardUid)
   → getProducts    ← productList
   → createOrder    ← orderCreated   (실패 시 reason: outOfStock)
-  → requestPayment ← paymentResult
-  ← dispatchStatus / pickupReady    (broadcast push)
+  → requestPayment ← paymentResult  (카드가 바뀌면 reason: cardMismatch,
+                                      잔액부족이면 reason: insufficientBalance)
+  ← dispatchStatus / pickupReady / alert    (broadcast push)
 
 ★ push 는 모든 Qt 클라이언트에게 broadcast 된다.
   다른 손님 주문까지 날아오므로 반드시 내 orderId 인지 걸러야 한다.
 
-회원 기능은 아직 없다. 주문은 GUEST_MEMBER_ID 로 나간다.
+member 테이블은 없다. 주문은 RFID 카드 UID(cardUid)로 식별한다.
 
 실행:  python customerQt.py [--host 127.0.0.1] [--port 9000]
 """
@@ -44,10 +47,6 @@ from UI.theme import (
     COL_BG, COL_PANEL, COL_PANEL_HDR, COL_SIDE_SEL, COL_TEXT,
     COL_SUBTLE, COL_LINE, COL_OK, COL_WARN, COL_DANGER,
 )
-
-# 회원 기능 전이라 모든 주문이 이 회원으로 나간다.
-# TODO: 로그인 붙으면 로그인한 회원 id 로 바꾼다.
-GUEST_MEMBER_ID = 1
 
 STOCK_POLL_MS = 8000      # 다른 손님이 사가면 재고가 줄어드니 주기적으로 다시 본다
 DONE_RESET_MS = 6000      # 완료 화면을 보여준 뒤 처음으로 돌아가기까지
@@ -172,6 +171,8 @@ class CustomerKiosk(QMainWindow):
 
         self._products: list[dict] = []
         self._cards: dict[int, ProductCard] = {}    # productId -> 카드
+        self._cardUid: str | None = None             # 카드 태그로 얻은 내 카드 UID
+        self._cardBalance: int | None = None         # 헤더에 표시할 카드 잔액
         self._orderId: int | None = None            # 내 주문. push 를 거를 기준
         self._orderTotal = 0
 
@@ -183,6 +184,7 @@ class CustomerKiosk(QMainWindow):
 
         outer.addLayout(self._buildHeader())
         self._stack = QStackedWidget()
+        self._stack.addWidget(self._pageCardTag())
         self._stack.addWidget(self._pageSelect())
         self._stack.addWidget(self._pagePay())
         self._stack.addWidget(self._pageProgress())
@@ -207,14 +209,63 @@ class CustomerKiosk(QMainWindow):
         bar = QHBoxLayout()
         logo = QLabel("SmartMart")
         logo.setStyleSheet(f"color:{COL_TEXT};font-size:26px;font-weight:800;")
-        self._title = QLabel("상품을 골라주세요")
+        self._balanceLabel = QLabel("")   # 카드 태그 전엔 비어있음
+        self._balanceLabel.setStyleSheet(
+            f"color:{COL_OK};font-size:18px;font-weight:700;")
+        self._title = QLabel("카드를 태그해주세요")
         self._title.setStyleSheet(f"color:{COL_SUBTLE};font-size:18px;")
         bar.addWidget(logo)
         bar.addStretch(1)
+        bar.addWidget(self._balanceLabel)
+        bar.addSpacing(16)
         bar.addWidget(self._title)
         return bar
 
-    # ── 화면 0: 상품 선택 ────────────────────────────────────────
+    def _setBalance(self, balance: int | None):
+        self._cardBalance = balance
+        self._balanceLabel.setText(f"잔액 {balance:,}원" if balance is not None else "")
+
+    # ── 화면 0: 카드 태그 (상품 고르기 전에 cardUid 를 확보) ──────
+    def _pageCardTag(self) -> QWidget:
+        page = QWidget()
+        lay = QVBoxLayout(page)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.addStretch(1)
+
+        icon = QLabel("💳")
+        icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        icon.setStyleSheet("font-size:64px;")
+        lay.addWidget(icon)
+
+        main = QLabel("카드를 태그해주세요")
+        main.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        main.setWordWrap(True)
+        main.setStyleSheet(f"color:{COL_TEXT};font-size:32px;font-weight:800;")
+        lay.addWidget(main)
+
+        self._tagHint = QLabel("")
+        self._tagHint.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._tagHint.setStyleSheet(f"color:{COL_SUBTLE};font-size:16px;")
+        lay.addWidget(self._tagHint)
+
+        lay.addSpacing(24)
+        self._tagBtn = bigButton("카드 태그하기")
+        self._tagBtn.clicked.connect(self._requestCardTag)
+        btnRow = QHBoxLayout()
+        btnRow.addStretch(1)
+        btnRow.addWidget(self._tagBtn)
+        btnRow.addStretch(1)
+        lay.addLayout(btnRow)
+        lay.addStretch(1)
+        return page
+
+    def _requestCardTag(self):
+        self._tagBtn.setEnabled(False)
+        self._tagHint.setStyleSheet(f"color:{COL_SUBTLE};font-size:16px;")
+        self._tagHint.setText("카드를 리더기에 올려주세요…")
+        self._net.send({"cmd": "tagCard"})
+
+    # ── 화면 1: 상품 선택 ────────────────────────────────────────
     def _pageSelect(self) -> QWidget:
         page = QWidget()
         lay = QVBoxLayout(page)
@@ -289,7 +340,7 @@ class CustomerKiosk(QMainWindow):
         self._totalLabel.setText(f"{total:,}원")
         self._orderBtn.setEnabled(bool(items) and self._net.isConnected())
 
-    # ── 화면 1: 결제 ─────────────────────────────────────────────
+    # ── 화면 2: 결제 ─────────────────────────────────────────────
     def _pagePay(self) -> QWidget:
         page = QWidget()
         lay = QVBoxLayout(page)
@@ -347,7 +398,7 @@ class CustomerKiosk(QMainWindow):
         self._payHint.setText("")
         self._payBtn.setEnabled(True)
         self._cancelBtn.setEnabled(True)
-        self._showPage(1, "결제")
+        self._showPage(2, "결제")
 
     def _submitOrder(self):
         """createOrder → (성공하면) requestPayment 로 이어진다."""
@@ -359,7 +410,7 @@ class CustomerKiosk(QMainWindow):
         self._payHint.setText("")
         self._payBtn.setText("주문 확인 중…")
         self._net.send({"cmd": "createOrder",
-                           "memberId": GUEST_MEMBER_ID, "items": items})
+                           "cardUid": self._cardUid, "items": items})
 
     def _payFailed(self, message: str):
         self._payHint.setText(message)
@@ -367,7 +418,7 @@ class CustomerKiosk(QMainWindow):
         self._payBtn.setEnabled(True)
         self._cancelBtn.setEnabled(True)
 
-    # ── 화면 2: 진행/완료 ────────────────────────────────────────
+    # ── 화면 3: 진행/완료 ────────────────────────────────────────
     def _pageProgress(self) -> QWidget:
         page = QWidget()
         lay = QVBoxLayout(page)
@@ -405,13 +456,27 @@ class CustomerKiosk(QMainWindow):
         self._title.setText(title)
 
     def _goSelect(self):
+        """결제 화면에서 '취소' — 같은 손님이니 카드는 다시 안 태그하고 장바구니로."""
         self._orderId = None
         for card in self._cards.values():
             card.reset()
         self._payBtn.setText("카드 결제")
         self._refreshCart()
-        self._showPage(0, "상품을 골라주세요")
+        self._showPage(1, "상품을 골라주세요")
         self._requestProducts()
+
+    def _goCardTag(self):
+        """주문 완료(픽업까지 끝) 후 처음으로 — 다음 손님을 위해 카드도 새로 태그."""
+        self._cardUid = None
+        self._orderId = None
+        for card in self._cards.values():
+            card.reset()
+        self._payBtn.setText("카드 결제")
+        self._refreshCart()
+        self._setBalance(None)
+        self._tagBtn.setEnabled(True)
+        self._tagHint.setText("")
+        self._showPage(0, "카드를 태그해주세요")
 
     # ── 하단 상태 ────────────────────────────────────────────────
     def _statusBar(self) -> QWidget:
@@ -452,14 +517,34 @@ class CustomerKiosk(QMainWindow):
 
     def _onMessage(self, msg: dict):
         handler = {
+            "cardTagResult": self._hCardTagResult,
             "productList":   self._hProductList,
             "orderCreated":  self._hOrderCreated,
             "paymentResult": self._hPaymentResult,
             "dispatchStatus": self._hDispatchStatus,
             "pickupReady":   self._hPickupReady,
+            "alert":         self._hAlert,
         }.get(msg.get("cmd"))
         if handler:
             handler(msg)
+
+    def _hCardTagResult(self, msg: dict):
+        self._tagBtn.setEnabled(True)
+        if not msg.get("success"):
+            reason = msg.get("reason", "")
+            text = {
+                "noCard": "카드를 인식하지 못했습니다. 다시 태그해주세요",
+                "readerBusy": "잠시 후 다시 시도해주세요",
+                "cardTimeout": "시간이 초과되었습니다. 다시 시도해주세요",
+            }.get(reason, f"카드 인식 실패 ({reason})")
+            self._tagHint.setStyleSheet(f"color:{COL_DANGER};font-size:16px;")
+            self._tagHint.setText(text)
+            return
+        self._cardUid = msg.get("cardUid")
+        self._setBalance(msg.get("balance"))
+        self._tagHint.setText("")
+        self._showPage(1, "상품을 골라주세요")
+        self._requestProducts()
 
     def _hProductList(self, msg: dict):
         self._products = msg.get("items", [])
@@ -480,11 +565,21 @@ class CustomerKiosk(QMainWindow):
         if msg.get("orderId") != self._orderId:
             return
         if msg.get("status") != "success":
-            self._payFailed(f"결제 실패 ({msg.get('reason', '')})")
+            reason = msg.get("reason", "")
+            text = {
+                "insufficientBalance": "카드 잔액이 부족합니다",
+                "cardMismatch": "처음 태그한 카드와 다릅니다. 같은 카드로 결제해주세요",
+                "noCard": "카드를 인식하지 못했습니다. 다시 태그해주세요",
+                "cardTimeout": "카드 태그 시간이 초과되었습니다. 다시 시도해주세요",
+                "readerBusy": "잠시 후 다시 시도해주세요",
+            }.get(reason, f"결제 실패 ({reason})")
+            self._payFailed(text)
             return
+        if "balance" in msg:
+            self._setBalance(msg["balance"])
         self._setProgress("🧾", "결제가 완료되었습니다",
                           f"주문번호 {self._orderId} · 상품을 준비합니다")
-        self._showPage(2, "주문 진행")
+        self._showPage(3, "주문 진행")
 
     def _hDispatchStatus(self, msg: dict):
         # ★ broadcast 라 다른 손님 주문도 온다. 내 것만 본다.
@@ -495,7 +590,7 @@ class CustomerKiosk(QMainWindow):
             self._setProgress("📦", "상품을 준비하고 있습니다", "잠시만 기다려주세요")
         elif state == OrderStatus.DONE:
             self._setProgress("🙇", "이용해 주셔서 감사합니다", "곧 처음 화면으로 돌아갑니다")
-            QTimer.singleShot(DONE_RESET_MS, self._goSelect)
+            QTimer.singleShot(DONE_RESET_MS, self._goCardTag)
         elif state == OrderStatus.ERROR:
             self._setProgress("⚠️", "출고 중 문제가 발생했습니다",
                               "직원을 호출해 주세요", COL_DANGER)
@@ -505,6 +600,13 @@ class CustomerKiosk(QMainWindow):
             return
         self._setProgress("✅", f"{msg.get('slot')}번 함에서 찾아가세요",
                           "물건을 꺼내시면 주문이 완료됩니다", COL_OK)
+
+    def _hAlert(self, msg: dict):
+        # ★ broadcast 라 다른 손님 주문 알림도 온다. 내 것만 본다.
+        if msg.get("orderId") != self._orderId:
+            return
+        self._setProgress("⏳", msg.get("message") or "잠시만 기다려주세요",
+                          "곧 이어서 진행됩니다", COL_WARN)
 
     def closeEvent(self, event):
         self._net.stop()

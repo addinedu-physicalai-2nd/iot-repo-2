@@ -184,7 +184,6 @@ class AdminDashboard(QMainWindow):
 
         # ── 서버에서 받은 데이터 = 모든 패널의 단일 출처 ─────────
         self._orders: dict[int, dict] = {}                       # orderId -> 주문 dict
-        self._members: dict[int, str] = {}                       # memberId -> 이름
         self._products: list[dict] = []                          # 상품/재고
         self._slots: dict[int, int | None] = {n: None for n in range(1, SLOT_COUNT + 1)}
         self._hasAlert = False
@@ -386,7 +385,7 @@ class AdminDashboard(QMainWindow):
         body.addLayout(bar)
 
         table = QTableWidget(0, 5)
-        table.setHorizontalHeaderLabels(["주문번호", "회원", "상태", "슬롯", "상품"])
+        table.setHorizontalHeaderLabels(["주문번호", "카드", "상태", "슬롯", "상품"])
         table.verticalHeader().setVisible(False)
         table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         table.setStyleSheet(
@@ -490,7 +489,7 @@ class AdminDashboard(QMainWindow):
             items = o.get("items") or []
             itemText = ", ".join(f"#{it.get('productId')}×{it.get('qty')}"
                                  for it in items) if items else "-"
-            values = [str(o.get("id", "-")), self._memberName(o.get("memberId")),
+            values = [str(o.get("id", "-")), self._cardLabel(o.get("cardUid")),
                       status, str(slot) if slot else "-", itemText]
             for c, value in enumerate(values):
                 item = QTableWidgetItem(value)
@@ -516,7 +515,7 @@ class AdminDashboard(QMainWindow):
     def _panelOrders(self) -> QFrame:
         frame, body = panel("실시간 주문 현황")
         table = QTableWidget(0, 4)
-        table.setHorizontalHeaderLabels(["주문번호", "회원", "상태", "슬롯"])
+        table.setHorizontalHeaderLabels(["주문번호", "카드", "상태", "슬롯"])
         table.verticalHeader().setVisible(False)
         table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         table.setStyleSheet(
@@ -565,7 +564,7 @@ class AdminDashboard(QMainWindow):
             slot = o.get("assignedSlot")
             status = o.get("status", "-")
             vals = [str(o.get("id", "-")),
-                    self._memberName(o.get("memberId")),
+                    self._cardLabel(o.get("cardUid")),
                     status,
                     str(slot) if slot else "-"]
             for c, val in enumerate(vals):
@@ -575,10 +574,11 @@ class AdminDashboard(QMainWindow):
                     item.setForeground(QColor(STATUS_COLOR.get(status, COL_TEXT)))
                 t.setItem(r, c, item)
 
-    def _memberName(self, memberId) -> str:
-        if memberId is None:
+    def _cardLabel(self, cardUid) -> str:
+        """카드 UID(hex) 짧게 표시. 결제 태그 전이면 아직 없음."""
+        if not cardUid:
             return "-"
-        return self._members.get(memberId, f"#{memberId}")
+        return cardUid.upper()
 
     # ── 패널: 상품별 재고 (SR-15) ────────────────────────────────
     def _panelStock(self) -> QFrame:
@@ -822,7 +822,6 @@ class AdminDashboard(QMainWindow):
     # ── 연결 상태 ────────────────────────────────────────────────
     def _onConnected(self):
         self._setServerStatus(True)
-        self._net.send({"cmd": "getMembers"})   # 회원 이름표 (한 번만)
         self._requestRefresh()
 
     def _onDisconnected(self):
@@ -836,7 +835,6 @@ class AdminDashboard(QMainWindow):
             # 요청 응답
             "allOrdersData":     self._hAllOrders,
             "productList":        self._hProductList,
-            "memberList":         self._hMemberList,
             "updateStockResult": self._hUpdateStockResult,
             "resetTestDataResult": self._hResetTestDataResult,
             # push (broadcast)
@@ -862,11 +860,6 @@ class AdminDashboard(QMainWindow):
         self._products = msg.get("items", [])
         self._refreshStock()
 
-    def _hMemberList(self, msg: dict):
-        self._members = {m["id"]: m.get("name", f"#{m['id']}")
-                         for m in msg.get("members", []) if "id" in m}
-        self._refreshOrders()
-
     def _hUpdateStockResult(self, msg: dict):
         if msg.get("success"):
             self._scheduleResync()
@@ -890,7 +883,7 @@ class AdminDashboard(QMainWindow):
         order = self._orders.get(orderId)
         if order is None:
             # 표에 없던 주문 → 일단 상태만 잡아두고 나머지는 재조회로 채운다
-            order = {"id": orderId, "memberId": None, "assignedSlot": None}
+            order = {"id": orderId, "cardUid": None, "assignedSlot": None}
             self._orders[orderId] = order
             self._scheduleResync()
         order["status"] = state
@@ -909,7 +902,7 @@ class AdminDashboard(QMainWindow):
     def _hPickupReady(self, msg: dict):
         orderId, slot = msg.get("orderId"), msg.get("slot")
         order = self._orders.setdefault(
-            orderId, {"id": orderId, "memberId": None, "status": OrderStatus.PICKUP_READY})
+            orderId, {"id": orderId, "cardUid": None, "status": OrderStatus.PICKUP_READY})
         order["assignedSlot"] = slot
         if slot in self._slots:
             self._slots[slot] = orderId
