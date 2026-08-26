@@ -489,7 +489,7 @@ class AdminDashboard(QMainWindow):
             items = o.get("items") or []
             itemText = ", ".join(f"#{it.get('productId')}×{it.get('qty')}"
                                  for it in items) if items else "-"
-            values = [str(o.get("id", "-")), self._cardLabel(o.get("cardUid")),
+            values = [str(o.get("id", "-")), self._cardLabel(o),
                       status, str(slot) if slot else "-", itemText]
             for c, value in enumerate(values):
                 item = QTableWidgetItem(value)
@@ -564,7 +564,7 @@ class AdminDashboard(QMainWindow):
             slot = o.get("assignedSlot")
             status = o.get("status", "-")
             vals = [str(o.get("id", "-")),
-                    self._cardLabel(o.get("cardUid")),
+                    self._cardLabel(o),
                     status,
                     str(slot) if slot else "-"]
             for c, val in enumerate(vals):
@@ -574,11 +574,13 @@ class AdminDashboard(QMainWindow):
                     item.setForeground(QColor(STATUS_COLOR.get(status, COL_TEXT)))
                 t.setItem(r, c, item)
 
-    def _cardLabel(self, cardUid) -> str:
-        """카드 UID(hex) 짧게 표시. 결제 태그 전이면 아직 없음."""
-        if not cardUid:
-            return "-"
-        return cardUid.upper()
+    def _cardLabel(self, order: dict) -> str:
+        """회원 이름을 우선 표시하고, 없으면 카드 UID, 그것도 없으면 '-'."""
+        name = order.get("memberName")
+        if name:
+            return name
+        cardUid = order.get("cardUid")
+        return cardUid.upper() if cardUid else "-"
 
     # ── 패널: 상품별 재고 (SR-15) ────────────────────────────────
     def _panelStock(self) -> QFrame:

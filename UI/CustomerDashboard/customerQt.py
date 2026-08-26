@@ -171,7 +171,9 @@ class CustomerKiosk(QMainWindow):
 
         self._products: list[dict] = []
         self._cards: dict[int, ProductCard] = {}    # productId -> 카드
-        self._cardUid: str | None = None             # 카드 태그로 얻은 내 카드 UID
+        self._cardId: int | None = None              # 카드 태그로 얻은 카드 id (주문 생성에 씀)
+        self._cardUid: str | None = None             # 카드 물리 UID (표시/서버가 재확인용)
+        self._memberName: str | None = None          # 헤더에 표시할 회원 이름
         self._cardBalance: int | None = None         # 헤더에 표시할 카드 잔액
         self._orderId: int | None = None            # 내 주문. push 를 거를 기준
         self._orderTotal = 0
@@ -223,7 +225,16 @@ class CustomerKiosk(QMainWindow):
 
     def _setBalance(self, balance: int | None):
         self._cardBalance = balance
-        self._balanceLabel.setText(f"잔액 {balance:,}원" if balance is not None else "")
+        self._refreshHeaderInfo()
+
+    def _refreshHeaderInfo(self):
+        """헤더의 회원명·잔액 표시를 self._memberName/_cardBalance 로 다시 그린다."""
+        parts = []
+        if self._memberName:
+            parts.append(f"{self._memberName}님")
+        if self._cardBalance is not None:
+            parts.append(f"잔액 {self._cardBalance:,}원")
+        self._balanceLabel.setText(" · ".join(parts))
 
     # ── 화면 0: 카드 태그 (상품 고르기 전에 cardUid 를 확보) ──────
     def _pageCardTag(self) -> QWidget:
@@ -409,7 +420,7 @@ class CustomerKiosk(QMainWindow):
         self._cancelBtn.setEnabled(False)
         self._payHint.setText("")
         self._payBtn.setText("주문 확인 중…")
-        self._net.send({"cmd": "createOrder",
+        self._net.send({"cmd": "createOrder", "cardId": self._cardId,
                            "cardUid": self._cardUid, "items": items})
 
     def _payFailed(self, message: str):
@@ -467,7 +478,9 @@ class CustomerKiosk(QMainWindow):
 
     def _goCardTag(self):
         """주문 완료(픽업까지 끝) 후 처음으로 — 다음 손님을 위해 카드도 새로 태그."""
+        self._cardId = None
         self._cardUid = None
+        self._memberName = None
         self._orderId = None
         for card in self._cards.values():
             card.reset()
@@ -534,13 +547,16 @@ class CustomerKiosk(QMainWindow):
             reason = msg.get("reason", "")
             text = {
                 "noCard": "카드를 인식하지 못했습니다. 다시 태그해주세요",
+                "cardNotRegistered": "등록되지 않은 카드입니다. 직원에게 문의해주세요",
                 "readerBusy": "잠시 후 다시 시도해주세요",
                 "cardTimeout": "시간이 초과되었습니다. 다시 시도해주세요",
             }.get(reason, f"카드 인식 실패 ({reason})")
             self._tagHint.setStyleSheet(f"color:{COL_DANGER};font-size:16px;")
             self._tagHint.setText(text)
             return
+        self._cardId = msg.get("cardId")
         self._cardUid = msg.get("cardUid")
+        self._memberName = msg.get("memberName")
         self._setBalance(msg.get("balance"))
         self._tagHint.setText("")
         self._showPage(1, "상품을 골라주세요")
