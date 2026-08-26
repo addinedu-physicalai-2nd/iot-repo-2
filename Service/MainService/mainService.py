@@ -66,13 +66,20 @@ class Order:
 
     def __init__(self, orderId: int, items: list,
                  status: str = OrderStatus.PENDING, assignedSlot: int | None = None,
-                 totalPrice: int = 0, cardUid: str | None = None, db=None):
+                 totalPrice: int = 0, cardId: int | None = None,
+                 cardUid: str | None = None, memberName: str | None = None,
+                 balanceBefore: int | None = None, balanceAfter: int | None = None,
+                 db=None):
         self.orderId = orderId
         self.items = items
         self.status = status
         self.assignedSlot = assignedSlot
         self.totalPrice = totalPrice   # RFID 잔액 결제 시 카드 잔액과 비교하는 데 씀
-        self.cardUid = cardUid         # 결제 태그 전엔 None. member 를 대신함
+        self.cardId = cardId           # orders.card_id FK — 결제 검증/저장에 씀
+        self.cardUid = cardUid         # 표시·재태그 비교용(카드 물리 UID)
+        self.memberName = memberName   # 관리자 화면 표시용
+        self.balanceBefore = balanceBefore
+        self.balanceAfter = balanceAfter
         self._db = db  # 상태 변경 시 위임 저장할 DBManager 참조
 
     # ── 상태 변경 → 곧바로 DB에 위임 저장 ────────────────────────
@@ -102,7 +109,11 @@ class Order:
             status=row.get("status", OrderStatus.PENDING),
             assignedSlot=row.get("assignedSlot"),
             totalPrice=row.get("totalPrice", 0),
+            cardId=row.get("cardId"),
             cardUid=row.get("cardUid"),
+            memberName=row.get("memberName"),
+            balanceBefore=row.get("balanceBefore"),
+            balanceAfter=row.get("balanceAfter"),
             db=db,
         )
 
@@ -110,6 +121,7 @@ class Order:
         return {
             "id": self.orderId,
             "cardUid": self.cardUid,
+            "memberName": self.memberName,
             "items": self.items,
             "status": self.status,
             "assignedSlot": self.assignedSlot,
@@ -229,11 +241,13 @@ class MainService:
                 print("[CC] 카드 태그 대기 (주문 시작)")
 
         elif cmd == "createOrder":
-            cardUid = msg["cardUid"]
-            ok, orderId, total = self.db.createOrder(cardUid, msg["items"])
+            # cardId/cardUid 는 tagCard 응답으로 클라이언트가 이미 들고 있는 값
+            # (등록된 카드인지는 tagCard 때 이미 확인됨 — 여기서 다시 안 물어봄).
+            cardId = msg["cardId"]
+            ok, orderId, total = self.db.createOrder(cardId, msg["items"])
             if ok:
                 self.orders[orderId] = Order(
-                    orderId, msg["items"], cardUid=cardUid,
+                    orderId, msg["items"], cardId=cardId, cardUid=msg.get("cardUid"),
                     status=OrderStatus.PENDING, totalPrice=total, db=self.db)
                 resp = {"cmd": "orderCreated", "success": True,
                         "orderId": orderId, "totalPrice": total}
@@ -354,7 +368,7 @@ class MainService:
             self._onPaymentRfidResponse(msg)
         # 둘 다 없으면 늦게 온 응답 등 — 무시
 
-    # ── 카드 태그 (tagCard — 상품 고르기 전, cardUid + 잔액을 읽어온다) ──
+    # ── 카드 태그 (tagCard — 상품 고르기 전, card/member 확인 + 잔액을 읽어온다) ──
     def _onCardTagResponse(self, msg: dict):
         pending = self._pendingCardTag
         if msg.get("cmd") != pending["step"]:
@@ -366,19 +380,29 @@ class MainService:
                 self.network.sendTo(pending["clientId"], {
                     "cmd": "cardTagResult", "success": False, "reason": "noCard"})
                 return
-            pending["uid"] = msg["uid"]
+            card = self.db.getCardByUid(msg["uid"])
+            if card is None:
+                # 등록 안 된 카드 — 주문 자체를 거부한다.
+                self._pendingCardTag = None
+                print(f"[CC] 미등록 카드 태그: {msg['uid']}")
+                self.network.sendTo(pending["clientId"], {
+                    "cmd": "cardTagResult", "success": False, "reason": "cardNotRegistered"})
+                return
+            pending["card"] = card   # {id, memberId, uid, memberName}
             pending["step"] = "GT"
-            self.network.sendBoard({"cmd": "getCardBalance", "uid": pending["uid"]})
+            self.network.sendBoard({"cmd": "getCardBalance", "uid": card["uid"]})
 
         elif pending["step"] == "GT":
             self._pendingCardTag = None
-            # 잔액 조회는 실패해도 UID 는 이미 확보했으니 태그 자체는 성공으로 친다.
+            card = pending["card"]
+            # 잔액 조회는 실패해도 카드/회원 확인은 이미 끝났으니 태그는 성공으로 친다.
             # 화면엔 잔액이 그냥 안 뜨거나 "-" 로 나온다.
             balance = msg["total"] if msg.get("ok") else None
-            print(f"[CC] 카드 태그 완료: {pending['uid']} (잔액: {balance})")
+            print(f"[CC] 카드 태그 완료: {card['uid']} ({card['memberName']}, 잔액: {balance})")
             self.network.sendTo(pending["clientId"], {
                 "cmd": "cardTagResult", "success": True,
-                "cardUid": pending["uid"], "balance": balance})
+                "cardId": card["id"], "cardUid": card["uid"],
+                "memberName": card["memberName"], "balance": balance})
 
     # ── 결제 확인 (requestPayment 가 시작해서 GS→GT→ST 순으로 진행) ──
     def _onPaymentRfidResponse(self, msg: dict):
@@ -416,6 +440,7 @@ class MainService:
                 self.orders.pop(order.orderId, None)
                 self._failPayment("insufficientBalance")
                 return
+            pending["balanceBefore"] = balance
             pending["newBalance"] = balance - order.totalPrice
             pending["step"] = "ST"
             self.network.sendBoard({"cmd": "setCardBalance", "uid": order.cardUid,
@@ -434,8 +459,10 @@ class MainService:
         order = self.orders.get(pending["orderId"])
         if order is None:
             return
-        self.db.confirmPayment(order.orderId)
+        self.db.confirmPayment(order.orderId, pending["balanceBefore"], pending["newBalance"])
         order.status = OrderStatus.PAID  # confirmPayment 가 이미 DB 에 반영함
+        order.balanceBefore = pending["balanceBefore"]
+        order.balanceAfter = pending["newBalance"]
         print(f"[CC] 주문 {order.orderId} RFID 결제 완료 (카드 남은 잔액 {pending['newBalance']})")
         self.network.sendTo(pending["clientId"], {
             "cmd": "paymentResult", "orderId": order.orderId, "status": "success",
