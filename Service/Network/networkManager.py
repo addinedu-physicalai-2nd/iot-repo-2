@@ -44,12 +44,15 @@ BOARDS: dict[str, dict] = {
         "transport": "tcp",
         "commands": ["startOrder"],
     },
-    # 픽업 보드 — 노트북에 USB 직결. 픽업박스 3개 상태 감지(센서 전용).
+    # 픽업 보드 — 노트북에 USB 직결. 픽업박스 3개 상태 감지 + RFID(MFRC522) 카드
+    # 잔액 조회/기록. 하드웨어가 다시 바뀔 예정이라 포트/보드레이트는 기존 값 유지.
+    # ★ 지금 PickUpControlBoard.ino 는 Serial.begin(9600) 이라 baud 값이 실제
+    #   하드웨어와 안 맞을 수 있음 — 최종 하드웨어 확정되면 다시 맞춰야 한다.
     "pickup": {
         "transport": "serial",
         "port": "/dev/ttyUSB0",
         "baud": 115200,
-        "commands": [],
+        "commands": ["getCardStatus", "getCardBalance", "setCardBalance"],
     },
 }
 
