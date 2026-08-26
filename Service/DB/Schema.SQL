@@ -9,20 +9,6 @@ CREATE DATABASE IF NOT EXISTS smartmart
 USE smartmart;
 
 -- ----------------------------------------------------------------------
--- member
--- ----------------------------------------------------------------------
-CREATE TABLE IF NOT EXISTS member (
-    id          INT AUTO_INCREMENT PRIMARY KEY,
-    username    VARCHAR(32) NOT NULL,
-    password    VARCHAR(32) NOT NULL,
-    name        VARCHAR(32) NOT NULL,
-    contact     VARCHAR(32),
-    is_admin    BOOLEAN NOT NULL DEFAULT FALSE,
-    created_at  DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    UNIQUE KEY uq_member_username (username)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-
--- ----------------------------------------------------------------------
 -- product
 -- ----------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS product (
@@ -35,15 +21,13 @@ CREATE TABLE IF NOT EXISTS product (
 
 CREATE TABLE IF NOT EXISTS orders (
     id              INT AUTO_INCREMENT PRIMARY KEY,
-    member_id       INT NOT NULL,
+    card_uid        VARCHAR(8) NULL,   -- RFID 카드 UID(hex). 결제 태그 전까진 NULL
     status          ENUM('대기', '결제완료', '출고중', '픽업대기', '완료', '오류')
                         NOT NULL DEFAULT '대기',
     assigned_slot   INT NULL,
     total_price     INT NOT NULL,
     created_at      DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    paid_at         DATETIME NULL,
-    CONSTRAINT fk_order_member
-        FOREIGN KEY (member_id) REFERENCES member(id)
+    paid_at         DATETIME NULL
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 -- ----------------------------------------------------------------------

@@ -21,16 +21,16 @@ load_dotenv(_MODULE_DIR / ".env")   # cwd 와 무관하게 항상 이 파일 옆
 _SCHEMA_PATH = _MODULE_DIR / "Schema.SQL"
 
 # orders 테이블 컬럼(snake_case) -> 서버가 쓰는 camelCase 로 alias.
-# mainService.Order.fromDbRow() 가 memberId/assignedSlot 키를 그대로 기대한다.
+# mainService.Order.fromDbRow() 가 cardUid/assignedSlot 키를 그대로 기대한다.
 _ORDER_SELECT = (
-    "SELECT id, member_id AS memberId, status, "
+    "SELECT id, card_uid AS cardUid, status, "
     "assigned_slot AS assignedSlot, total_price AS totalPrice, "
     "created_at AS createdAt, paid_at AS paidAt FROM orders "
 )
 
 
 class DBManager:
-    """member / product / orders / order_item 에 대한 CRUD 모음.
+    """product / orders / order_item 에 대한 CRUD 모음.
     mainService에서 db = DBManager() 로 한 번만 만들어서 계속 재사용한다."""
 
     def __init__(self):
@@ -81,57 +81,6 @@ class DBManager:
             conn.close()
 
     # ------------------------------------------------------------
-    # member
-    # ------------------------------------------------------------
-
-    def createMember(self, username, password, name="", contact=""):
-        """회원가입. 성공하면 (True, memberId), 아이디 중복이면 (False, None)."""
-        conn = self._connect()
-        with conn.cursor() as cur:
-            try:
-                cur.execute(
-                    "INSERT INTO member (username, password, name, contact) "
-                    "VALUES (%s, %s, %s, %s)",
-                    (username, password, name, contact),
-                )
-                return True, cur.lastrowid
-            except pymysql.err.IntegrityError:
-                return False, None
-
-    def login(self, username, password):
-        """로그인 확인. 성공하면 member 정보(dict), 실패하면 None.
-        비밀번호(password)와 연락처(contact)는 빼고 돌려줌."""
-        conn = self._connect()
-        with conn.cursor() as cur:
-            cur.execute(
-                "SELECT id, username, name, is_admin, created_at "
-                "FROM member WHERE username = %s AND password = %s",
-                (username, password),
-            )
-            row = cur.fetchone()
-            return self._memberToDict(row) if row else None
-
-    def getMembers(self):
-        """전체 회원 목록. 여기도 password/contact는 뺌."""
-        conn = self._connect()
-        with conn.cursor() as cur:
-            cur.execute(
-                "SELECT id, username, name, is_admin, created_at FROM member"
-            )
-            rows = cur.fetchall()
-            return [self._memberToDict(row) for row in rows]
-
-    def _memberToDict(self, row):
-        """DB 컬럼을 서버가 쓰는 Dic으로 바꿔줌."""
-        return {
-            "id": row["id"],
-            "username": row["username"],
-            "name": row["name"],
-            "isAdmin": bool(row["is_admin"]),
-            "createdAt": row["created_at"],
-        }
-
-    # ------------------------------------------------------------
     # product
     # ------------------------------------------------------------
 
@@ -161,9 +110,11 @@ class DBManager:
     # orders (핵심)
     # ------------------------------------------------------------
 
-    def createOrder(self, memberId, items):
+    def createOrder(self, cardUid, items):
         """
         주문 생성. items 예: [{"productId": 1, "qty": 2}, ...]
+        cardUid 는 상품 고르기 전에 이미 태그해서 알고 있는 값 — 주문 생성
+        시점부터 카드가 비어있는 행이 안 생기게 처음부터 넣는다.
         재고를 먼저 전부 확인하고, 하나라도 부족하면 아무것도 안 바꾸고 거절.
         전부 통과해야 그때 재고 차감 + 주문 생성.
         반환: (True, orderId, totalPrice) / 실패 시 (False, None, None)
@@ -195,9 +146,9 @@ class DBManager:
 
             # 3단계: 주문 헤더 생성
             cur.execute(
-                "INSERT INTO orders (member_id, status, total_price) "
+                "INSERT INTO orders (card_uid, status, total_price) "
                 "VALUES (%s, '대기', %s)",
-                (memberId, total),
+                (cardUid, total),
             )
             orderId = cur.lastrowid
 
@@ -210,6 +161,24 @@ class DBManager:
                 )
 
             return True, orderId, total
+
+    def cancelOrder(self, orderId):
+        """결제 실패(잔액부족 등)로 주문을 취소. createOrder 때 미리 깎은 재고를
+        되돌리고 주문/품목 행을 지운다."""
+        conn = self._connect()
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT product_id, qty FROM order_item WHERE order_id = %s",
+                (orderId,),
+            )
+            items = cur.fetchall()
+            for item in items:
+                cur.execute(
+                    "UPDATE product SET stock = stock + %s WHERE id = %s",
+                    (item["qty"], item["product_id"]),
+                )
+            cur.execute("DELETE FROM order_item WHERE order_id = %s", (orderId,))
+            cur.execute("DELETE FROM orders WHERE id = %s", (orderId,))
 
     def confirmPayment(self, orderId):
         """결제 확정 표시 (paidAt 기록 + status). 재고는 createOrder에서 이미 처리했음."""
@@ -241,9 +210,9 @@ class DBManager:
             order["items"] = self._getOrderItems(cur, orderId)
             return order
 
-    def getOrdersByMember(self, memberId):
-        """회원별 주문 이력."""
-        return self._listOrders("WHERE member_id = %s", (memberId,))
+    def getOrdersByCard(self, cardUid):
+        """카드별 주문 이력(카드 태그로 본인 주문 확인)."""
+        return self._listOrders("WHERE card_uid = %s", (cardUid,))
 
     def getOrdersByStatus(self, status):
         """상태별 조회. 서버 재시작 시 진행 중 주문 복구용으로 사용."""
@@ -315,7 +284,7 @@ class DBManager:
 
     def resetTestData(self, defaultStock=20):
         """개발/테스트 중 쌓인 주문을 지우고 재고를 defaultStock 으로 되돌린다.
-        member/product 는 안 건드림."""
+        product 는 안 건드림."""
         conn = self._connect()
         with conn.cursor() as cur:
             cur.execute("SET FOREIGN_KEY_CHECKS = 0")
