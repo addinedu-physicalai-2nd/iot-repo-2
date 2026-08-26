@@ -165,6 +165,10 @@ class MainService:
         # 충전 — 결제와 같은 GS→GT→ST 지만 빼는 대신 더한다. 주문과 무관하다.
         # {"cardUid", "amount", "clientId", "step": "GS"/"GT"/"ST", "since", ...}
         self._pendingCharge: dict | None = None
+        # 카드 등록(관리자) — GS 로 UID 만 읽는다. tagCard 와 달리 미등록 카드도
+        # 성공으로 돌려준다(등록하려고 읽는 거라 미등록인 게 정상이다).
+        # {"clientId", "since"}
+        self._pendingCardRead: dict | None = None
 
         self.network = NetworkManager(
             self.inQueue,
@@ -313,6 +317,30 @@ class MainService:
             # 이 명령은 방금 켜졌거나 재접속한 클라이언트가 현재 상태를 맞추는 용도다.
             resp = {"cmd": "slotData", "slots": self._slotSnapshot()}
 
+        elif cmd == "getMembers":
+            resp = {"cmd": "memberData", "members": self.db.getCards()}
+
+        elif cmd == "readCard":
+            # 관리자 화면의 카드 등록용 — UID 만 읽는다.
+            # tagCard 는 미등록 카드를 거절하지만 이건 그 반대가 정상이다.
+            if self._readerBusy():
+                resp = {"cmd": "readCardResult", "success": False, "reason": "readerBusy"}
+            else:
+                self._pendingCardRead = {"clientId": clientId, "since": time.monotonic()}
+                self.network.sendBoard({"cmd": "getCardStatus"})
+                print("[MS] 카드 UID 읽기 대기 (관리자 등록)")
+
+        elif cmd == "registerCard":
+            ok, detail = self.db.registerCard(
+                msg.get("uid"), msg.get("name"),
+                msg.get("contact"), msg.get("memberId"))
+            if ok:
+                print(f"[MS] 카드 등록: {msg.get('uid')} → {msg.get('name')} (cardId {detail})")
+                resp = {"cmd": "registerCardResult", "success": True, "cardId": detail}
+            else:
+                print(f"[MS] 카드 등록 실패: {detail} ({msg.get('uid')})")
+                resp = {"cmd": "registerCardResult", "success": False, "reason": detail}
+
         elif cmd == "getHistory":
             resp = {"cmd": "historyData",
                     "orders": self.db.getOrdersByCard(msg["cardUid"])}
@@ -409,7 +437,8 @@ class MainService:
         """카드 리더기가 하나뿐이라 카드 태그/결제 확인/충전을 동시에 못 한다."""
         return (self._pendingCardTag is not None
                 or self._pendingPayment is not None
-                or self._pendingCharge is not None)
+                or self._pendingCharge is not None
+                or self._pendingCardRead is not None)
 
     # ── RFID 응답 라우팅: 카드 태그(주문 시작) vs 결제 확인 중 진행 중인 쪽으로 ──
     def _onRfidResponse(self, msg: dict):
@@ -419,7 +448,9 @@ class MainService:
             self._onPaymentRfidResponse(msg)
         elif self._pendingCharge is not None:
             self._onChargeRfidResponse(msg)
-        # 셋 다 없으면 늦게 온 응답 등 — 무시
+        elif self._pendingCardRead is not None:
+            self._onCardReadResponse(msg)
+        # 넷 다 없으면 늦게 온 응답 등 — 무시
 
     # ── 카드 태그 (tagCard — 상품 고르기 전, card/member 확인 + 잔액을 읽어온다) ──
     def _onCardTagResponse(self, msg: dict):
@@ -534,6 +565,27 @@ class MainService:
         self.network.sendTo(pending["clientId"], {
             "cmd": "paymentResult", "orderId": pending["orderId"],
             "status": "fail", "reason": reason})
+
+    # ── 카드 UID 읽기 (readCard — 관리자 카드 등록용, GS 한 번뿐) ──
+    def _onCardReadResponse(self, msg: dict):
+        pending = self._pendingCardRead
+        if msg.get("cmd") != "GS":
+            return
+        self._pendingCardRead = None
+        if not msg.get("ok"):
+            self.network.sendTo(pending["clientId"], {
+                "cmd": "readCardResult", "success": False, "reason": "noCard"})
+            return
+        uid = (msg.get("uid") or "").lower()
+        # 이미 등록된 카드면 그 사실을 같이 알려준다 — 화면이 '이미 등록됨' 을
+        # 바로 보여줄 수 있게(등록 버튼을 눌러봐야 duplicateCard 로 실패한다).
+        card = self.db.getCardByUid(uid)
+        print(f"[MS] 카드 UID 읽음: {uid} "
+              f"({'등록됨: ' + card['memberName'] if card else '미등록'})")
+        self.network.sendTo(pending["clientId"], {
+            "cmd": "readCardResult", "success": True, "cardUid": uid,
+            "registered": card is not None,
+            "memberName": card["memberName"] if card else None})
 
     # ── 충전 (chargeCard 가 시작해서 GS→GT→ST 순으로 진행) ──────
     def _onChargeRfidResponse(self, msg: dict):
@@ -801,6 +853,15 @@ class MainService:
                 and now - self._pendingCharge["since"] > PAYMENT_TIMEOUT):
             print(f"[MS] 충전 {PAYMENT_TIMEOUT:.0f}초 무응답 — 충전 정리")
             self._failCharge("cardTimeout")
+
+        # 관리자가 카드를 안 올려도 리더기를 놓아준다.
+        if (self._pendingCardRead is not None
+                and now - self._pendingCardRead["since"] > PAYMENT_TIMEOUT):
+            print(f"[MS] 카드 읽기 {PAYMENT_TIMEOUT:.0f}초 무응답 — 정리")
+            pending = self._pendingCardRead
+            self._pendingCardRead = None
+            self.network.sendTo(pending["clientId"], {
+                "cmd": "readCardResult", "success": False, "reason": "cardTimeout"})
 
         # 주문 시작용 카드 태그도 마찬가지로 무한 대기하지 않게 한다.
         if (self._pendingCardTag is not None

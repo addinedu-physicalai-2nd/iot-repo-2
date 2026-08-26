@@ -127,6 +127,54 @@ class DBManager:
             )
             return cur.fetchone()
 
+    def getCards(self):
+        """등록된 카드 전체 (회원 정보 포함). 관리자 화면의 회원 관리 탭용."""
+        conn = self._connect()
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT c.id, c.uid, c.created_at AS createdAt, "
+                "m.id AS memberId, m.name AS memberName, m.contact "
+                "FROM card c JOIN member m ON c.member_id = m.id "
+                "ORDER BY c.id"
+            )
+            return cur.fetchall()
+
+    def registerCard(self, uid, name, contact=None, memberId=None):
+        """카드를 등록한다. 반환: (True, cardId) / 실패 시 (False, 사유)
+
+        memberId 를 주면 그 회원에게 카드를 한 장 더 붙이고(schema 가 1:N 허용),
+        안 주면 회원을 새로 만든다. uid 는 항상 소문자 hex 로 저장한다 —
+        보드/DB/클라이언트에 대소문자가 섞여도 같은 카드로 인식되게.
+        """
+        uid = (uid or "").strip().lower()
+        if not uid:
+            return False, "noUid"
+        if memberId is None and not (name or "").strip():
+            return False, "noName"
+
+        conn = self._connect()
+        with conn.cursor() as cur:
+            cur.execute("SELECT id FROM card WHERE uid = %s", (uid,))
+            if cur.fetchone() is not None:
+                return False, "duplicateCard"
+
+            if memberId is None:
+                cur.execute(
+                    "INSERT INTO member (name, contact) VALUES (%s, %s)",
+                    (name.strip(), (contact or "").strip() or None),
+                )
+                memberId = cur.lastrowid
+            else:
+                cur.execute("SELECT id FROM member WHERE id = %s", (memberId,))
+                if cur.fetchone() is None:
+                    return False, "noMember"
+
+            cur.execute(
+                "INSERT INTO card (member_id, uid) VALUES (%s, %s)",
+                (memberId, uid),
+            )
+            return True, cur.lastrowid
+
     def createOrder(self, cardId, items):
         """
         주문 생성. items 예: [{"productId": 1, "qty": 2}, ...]

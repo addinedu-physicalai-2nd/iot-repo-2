@@ -45,7 +45,7 @@ from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QLabel, QPushButton, QFrame,
     QVBoxLayout, QHBoxLayout, QGridLayout, QTableWidget, QTableWidgetItem,
     QHeaderView, QListWidget, QListWidgetItem, QStackedWidget, QSizePolicy,
-    QAbstractItemView, QMessageBox,
+    QAbstractItemView, QMessageBox, QLineEdit, QSpinBox, QScrollArea,
 )
 from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtGui import QFont, QColor, QPixmap
@@ -68,6 +68,13 @@ STATUS_COLOR = {
     OrderStatus.ERROR:        COL_DANGER,
 }
 
+# 화면 번호 (QStackedWidget 인덱스). _selectMenu 의 메뉴 이름과 짝을 이룬다.
+PAGE_DASHBOARD = 0
+PAGE_CAMERAS   = 1
+PAGE_ORDERS    = 2
+PAGE_STOCK     = 3
+PAGE_MEMBERS   = 4
+
 SLOT_COUNT      = 3        # 픽업 슬롯 개수 (하드웨어 구성)
 STOCK_CAP       = 20       # 상품 1칸 최대 적재량 (서버가 capacity 를 주면 그 값 사용)
 MAX_ORDER_ROWS  = 20       # 주문 표에 보여줄 최근 건수
@@ -87,9 +94,27 @@ LOG_DIRS = {               # commLog 의 dir -> (표시, 색)
 }
 
 
-def panel(title: str) -> tuple[QFrame, QVBoxLayout]:
-    """제목 헤더가 달린 패널 프레임을 만든다. (프레임, 본문레이아웃) 반환"""
-    frame = QFrame()
+class PanelFrame(QFrame):
+    """패널 한 장. onClick 을 주면 패널 전체가 눌리는 버튼처럼 동작한다."""
+
+    def __init__(self, onClick=None):
+        super().__init__()
+        self._onClick = onClick
+        if onClick is not None:
+            self.setCursor(Qt.CursorShape.PointingHandCursor)
+
+    def mouseReleaseEvent(self, event):
+        if self._onClick is not None and event.button() == Qt.MouseButton.LeftButton:
+            self._onClick()
+        super().mouseReleaseEvent(event)
+
+
+def panel(title: str, onClick=None) -> tuple[QFrame, QVBoxLayout]:
+    """제목 헤더가 달린 패널 프레임을 만든다. (프레임, 본문레이아웃) 반환
+
+    onClick 을 주면 패널을 눌러 다른 화면으로 넘어갈 수 있다(헤더에 → 표시).
+    """
+    frame = PanelFrame(onClick)
     # QLabel 이 QFrame 상속이라 QFrame{...} 로 쓰면 자식 라벨까지 테두리가 생긴다.
     frame.setObjectName("panelFrame")
     frame.setStyleSheet(
@@ -99,7 +124,7 @@ def panel(title: str) -> tuple[QFrame, QVBoxLayout]:
     outer.setContentsMargins(0, 0, 0, 0)
     outer.setSpacing(0)
 
-    hdr = QLabel(title)
+    hdr = QLabel(f"{title}   →" if onClick is not None else title)
     hdr.setStyleSheet(
         f"background:{COL_PANEL_HDR};color:{COL_TEXT};font-weight:600;"
         f"padding:10px 14px;border-top-left-radius:10px;"
@@ -185,12 +210,14 @@ class AdminDashboard(QMainWindow):
         # ── 서버에서 받은 데이터 = 모든 패널의 단일 출처 ─────────
         self._orders: dict[int, dict] = {}                       # orderId -> 주문 dict
         self._products: list[dict] = []                          # 상품/재고
+        self._members: list[dict] = []                           # 등록된 카드(+회원)
         self._slots: dict[int, int | None] = {n: None for n in range(1, SLOT_COUNT + 1)}
         self._hasAlert = False
         # 표 위젯은 페이지를 만들 때 채워진다. 페이지 0 을 만드는 도중
         # 아직 없는 페이지 2 의 표를 건드릴 수 있어 미리 비워둔다.
         self._ordersTable = None
         self._orderListTable = None
+        self._memberTable = None
         self._cams: dict[str, dict] = {}      # camId -> {view, status, count}
 
         root = QWidget()
@@ -274,20 +301,37 @@ class AdminDashboard(QMainWindow):
                 "border-radius:8px;}"
                 f"QPushButton:hover{{background:{COL_PANEL};color:{COL_TEXT};}}")
 
+    MENU_PAGES = {
+        "영상 모니터링": PAGE_CAMERAS,
+        "주문 관리":     PAGE_ORDERS,
+        "재고 관리":     PAGE_STOCK,
+        "회원 관리":     PAGE_MEMBERS,
+    }
+
     def _selectMenu(self, clickedBtn):
         for b in self._menuBtns:
             b.setStyleSheet(self._menuStyle(b is clickedBtn))
         name = clickedBtn.text()
-        # 아직 화면이 없는 메뉴는 대시보드를 유지한다. TODO: 나머지 화면 추가
-        page = {"영상 모니터링": 1, "주문 관리": 2}.get(name, 0)
+        # 아직 화면이 없는 메뉴는 대시보드를 유지한다. TODO: 화재·환경 화면 추가
+        page = self.MENU_PAGES.get(name, PAGE_DASHBOARD)
         self._showPage(page, name if page else "대시보드")
+
+    def _gotoMenu(self, name: str):
+        """사이드바를 누른 것과 똑같이 화면을 옮긴다(메뉴 하이라이트까지 맞춘다).
+
+        대시보드의 재고 패널을 눌렀을 때처럼 화면 안에서 이동시킬 때 쓴다.
+        """
+        for btn in self._menuBtns:
+            if btn.text() == name:
+                self._selectMenu(btn)
+                return
 
     def _showPage(self, index: int, title: str):
         self._stack.setCurrentIndex(index)
         self._title.setText(title)
         # 영상은 보고 있을 때만 받는다(안 보는 화면 때문에 대역폭 쓰지 않게)
         for camId, cam in self._cams.items():
-            if index == 1:
+            if index == PAGE_CAMERAS:
                 self._net.watchCamera(camId, VIDEO_FPS)
             else:
                 self._net.unwatchCamera(camId)
@@ -315,9 +359,11 @@ class AdminDashboard(QMainWindow):
 
         # 화면 전환: 0=대시보드, 1=영상 모니터링
         self._stack = QStackedWidget()
-        self._stack.addWidget(self._pageDashboard())
-        self._stack.addWidget(self._pageCameras())
-        self._stack.addWidget(self._pageOrderAdmin())
+        self._stack.addWidget(self._pageDashboard())    # PAGE_DASHBOARD
+        self._stack.addWidget(self._pageCameras())     # PAGE_CAMERAS
+        self._stack.addWidget(self._pageOrderAdmin())  # PAGE_ORDERS
+        self._stack.addWidget(self._pageStockAdmin())  # PAGE_STOCK
+        self._stack.addWidget(self._pageMemberAdmin()) # PAGE_MEMBERS
         lay.addWidget(self._stack, 1)
 
         # 하단 상태바
@@ -368,6 +414,248 @@ class AdminDashboard(QMainWindow):
         lay.addWidget(self._panelOrderList(), 2)
         lay.addWidget(self._panelCommLog(), 3)
         return page
+
+    # ── 화면 4: 재고 관리 ────────────────────────────────────────
+    def _pageStockAdmin(self) -> QWidget:
+        page = QWidget()
+        lay = QVBoxLayout(page)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(14)
+        lay.addWidget(self._panelStockAdmin(), 1)
+        return page
+
+    def _panelStockAdmin(self) -> QFrame:
+        frame, body = panel("상품별 재고 관리")
+
+        hint = QLabel("수량을 바꾼 뒤 [저장] 을 누르면 서버 재고가 바뀝니다.")
+        hint.setStyleSheet(f"color:{COL_SUBTLE};font-size:12px;")
+        body.addWidget(hint)
+
+        # 상품이 늘어나도 잘리지 않게 가로 스크롤을 둔다
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setStyleSheet("QScrollArea{background:transparent;border:none;}")
+        inner = QWidget()
+        inner.setStyleSheet("background:transparent;")
+        self._stockAdminRow = QHBoxLayout(inner)
+        self._stockAdminRow.setContentsMargins(0, 0, 0, 0)
+        self._stockAdminRow.setSpacing(14)
+        scroll.setWidget(inner)
+        body.addWidget(scroll, 1)
+
+        self._stockEdits: dict[int, QSpinBox] = {}   # productId -> 수량 입력칸
+        self._refreshStockAdmin()
+        return frame
+
+    def _refreshStockAdmin(self):
+        """productList 로 재고 편집 카드를 다시 그린다.
+
+        ★ 편집 중인 칸이 폴링(10초)에 덮이면 관리자가 입력하던 숫자가 날아간다.
+          그래서 손을 댄 칸(값이 서버 재고와 다른 칸)은 값을 건드리지 않는다.
+        """
+        pending = {pid: box.value() for pid, box in self._stockEdits.items()
+                   if box.property("dirty")}
+        clearLayout(self._stockAdminRow)
+        self._stockEdits.clear()
+
+        if not self._products:
+            self._stockAdminRow.addWidget(hintLabel("상품 정보 수신 대기 중…"))
+            self._stockAdminRow.addStretch(1)
+            return
+
+        for product in self._products:
+            pid = product.get("id")
+            # ★ AlignTop 은 addWidget 에 넘겨야 한다 — 레이아웃의 setAlignment 는
+            #   '레이아웃 자신을 부모 안에서' 정렬하는 것이라 항목엔 안 먹는다.
+            #   안 주면 남는 세로 공간이 게이지·뱃지로 퍼져 카드가 화면만큼 늘어난다.
+            self._stockAdminRow.addWidget(
+                self._stockEditCard(product, pending.get(pid)),
+                0, Qt.AlignmentFlag.AlignTop)
+        self._stockAdminRow.addStretch(1)
+
+    def _stockEditCard(self, product: dict, keepValue: int | None) -> QWidget:
+        """대시보드와 같은 게이지 + 수량 입력칸 + 저장 버튼."""
+        pid = product.get("id")
+        stock = int(product.get("stock", 0))
+        cap = int(product.get("capacity", STOCK_CAP))
+
+        card = QFrame()
+        card.setObjectName("stockEditCard")
+        card.setStyleSheet(
+            f"QFrame#stockEditCard{{background:{COL_BG};"
+            f"border:1px solid {COL_LINE};border-radius:10px;}}")
+        card.setFixedWidth(190)
+        lay = QVBoxLayout(card)
+        lay.setContentsMargins(14, 14, 14, 14)
+        lay.setSpacing(10)
+
+        # 대시보드 패널과 똑같은 게이지를 그대로 재사용한다
+        lay.addWidget(self._stockGauge(product.get("name", "?"), stock, cap))
+
+        price = QLabel(f"{int(product.get('price', 0)):,}원")
+        price.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        price.setStyleSheet(f"background:transparent;color:{COL_SUBTLE};font-size:12px;")
+        lay.addWidget(price)
+
+        box = QSpinBox()
+        box.setRange(0, 999)
+        box.setValue(keepValue if keepValue is not None else stock)
+        box.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        box.setStyleSheet(
+            f"QSpinBox{{background:{COL_PANEL};color:{COL_TEXT};"
+            f"border:1px solid {COL_LINE};border-radius:6px;"
+            "padding:6px;font-size:16px;font-weight:700;}")
+        # 서버 값과 달라진 칸은 '편집 중' 으로 표시해 폴링이 덮지 않게 한다
+        box.setProperty("dirty", keepValue is not None and keepValue != stock)
+        box.valueChanged.connect(
+            lambda v, b=box, base=stock: b.setProperty("dirty", v != base))
+        self._stockEdits[pid] = box
+        lay.addWidget(box)
+
+        save = QPushButton("저장")
+        save.setCursor(Qt.CursorShape.PointingHandCursor)
+        save.setStyleSheet(
+            f"QPushButton{{background:{COL_SIDE_SEL};color:white;border:none;"
+            "border-radius:6px;padding:7px 0;font-weight:600;}"
+            "QPushButton:hover{background:#3b7ceb;}")
+        save.clicked.connect(lambda _, i=pid, b=box: self._submitStock(i, b))
+        lay.addWidget(save)
+        return card
+
+    def _submitStock(self, productId, box: QSpinBox):
+        if productId is None:
+            return
+        newStock = box.value()
+        box.setProperty("dirty", False)   # 보냈으니 폴링이 서버 값으로 덮어도 된다
+        self._net.send({"cmd": "updateStock",
+                        "productId": productId, "newStock": newStock})
+        self._addAlert(f"재고 수정 요청: 상품 {productId} → {newStock}개", COL_SUBTLE)
+
+    # ── 화면 5: 회원 관리 ────────────────────────────────────────
+    def _pageMemberAdmin(self) -> QWidget:
+        page = QWidget()
+        lay = QVBoxLayout(page)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(14)
+        lay.addWidget(self._panelMemberList(), 3)
+        lay.addWidget(self._panelCardRegister(), 2)
+        return page
+
+    def _panelMemberList(self) -> QFrame:
+        frame, body = panel("등록된 카드")
+
+        table = QTableWidget(0, 4)
+        table.setHorizontalHeaderLabels(["회원명", "연락처", "카드 UID", "등록일"])
+        table.verticalHeader().setVisible(False)
+        table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        table.setStyleSheet(
+            f"QTableWidget{{background:{COL_PANEL};color:{COL_TEXT};"
+            f"gridline-color:{COL_LINE};border:none;}}"
+            f"QHeaderView::section{{background:{COL_PANEL_HDR};color:{COL_SUBTLE};"
+            f"border:none;padding:6px;}}")
+        table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self._memberTable = table
+        body.addWidget(table)
+        return frame
+
+    def _refreshMembers(self):
+        table = self._memberTable
+        table.setRowCount(0)
+        if not self._members:
+            return
+        for member in self._members:
+            row = table.rowCount()
+            table.insertRow(row)
+            created = member.get("createdAt")
+            cells = [
+                member.get("memberName") or "-",
+                member.get("contact") or "-",
+                (member.get("uid") or "-").upper(),
+                created.strftime("%Y-%m-%d %H:%M") if hasattr(created, "strftime")
+                else str(created or "-"),
+            ]
+            for col, text in enumerate(cells):
+                item = QTableWidgetItem(text)
+                item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                table.setItem(row, col, item)
+
+    def _panelCardRegister(self) -> QFrame:
+        frame, body = panel("새 카드 등록")
+
+        hint = QLabel("① 카드를 리더기에 올리고 [카드 읽기] → ② 이름·연락처 입력 → ③ [등록]")
+        hint.setStyleSheet(f"color:{COL_SUBTLE};font-size:12px;")
+        body.addWidget(hint)
+
+        form = QHBoxLayout()
+        form.setSpacing(10)
+
+        self._readCardBtn = QPushButton("카드 읽기")
+        self._readCardBtn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._readCardBtn.setStyleSheet(
+            f"QPushButton{{background:{COL_PANEL_HDR};color:{COL_TEXT};"
+            f"border:1px solid {COL_LINE};border-radius:6px;padding:8px 16px;}}"
+            f"QPushButton:hover{{background:{COL_LINE};}}"
+            f"QPushButton:disabled{{color:{COL_SUBTLE};}}")
+        self._readCardBtn.clicked.connect(self._requestReadCard)
+        form.addWidget(self._readCardBtn)
+
+        self._uidEdit = self._formEdit("카드 UID (읽기 또는 직접 입력)", 220)
+        self._nameEdit = self._formEdit("이름", 140)
+        self._contactEdit = self._formEdit("연락처 (선택)", 160)
+        form.addWidget(self._uidEdit)
+        form.addWidget(self._nameEdit)
+        form.addWidget(self._contactEdit)
+
+        self._registerBtn = QPushButton("등록")
+        self._registerBtn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._registerBtn.setStyleSheet(
+            f"QPushButton{{background:{COL_SIDE_SEL};color:white;border:none;"
+            "border-radius:6px;padding:8px 22px;font-weight:600;}"
+            "QPushButton:hover{background:#3b7ceb;}"
+            f"QPushButton:disabled{{background:{COL_PANEL_HDR};color:{COL_SUBTLE};}}")
+        self._registerBtn.clicked.connect(self._submitRegisterCard)
+        form.addWidget(self._registerBtn)
+        form.addStretch(1)
+        body.addLayout(form)
+
+        self._registerHint = QLabel("")
+        self._registerHint.setStyleSheet(f"color:{COL_SUBTLE};font-size:12px;")
+        body.addWidget(self._registerHint)
+        body.addStretch(1)
+        return frame
+
+    def _formEdit(self, placeholder: str, width: int) -> QLineEdit:
+        edit = QLineEdit()
+        edit.setPlaceholderText(placeholder)
+        edit.setFixedWidth(width)
+        edit.setStyleSheet(
+            f"QLineEdit{{background:{COL_BG};color:{COL_TEXT};"
+            f"border:1px solid {COL_LINE};border-radius:6px;padding:8px;}}")
+        return edit
+
+    def _setRegisterHint(self, text: str, color: str = COL_SUBTLE):
+        self._registerHint.setStyleSheet(f"color:{color};font-size:12px;")
+        self._registerHint.setText(text)
+
+    def _requestReadCard(self):
+        self._readCardBtn.setEnabled(False)
+        self._setRegisterHint("카드를 리더기에 올려주세요…")
+        self._net.send({"cmd": "readCard"})
+
+    def _submitRegisterCard(self):
+        uid = self._uidEdit.text().strip()
+        name = self._nameEdit.text().strip()
+        if not uid:
+            self._setRegisterHint("카드 UID 가 없습니다. [카드 읽기] 를 눌러주세요", COL_DANGER)
+            return
+        if not name:
+            self._setRegisterHint("이름을 입력해주세요", COL_DANGER)
+            return
+        self._registerBtn.setEnabled(False)
+        self._setRegisterHint("등록 중…")
+        self._net.send({"cmd": "registerCard", "uid": uid, "name": name,
+                        "contact": self._contactEdit.text().strip() or None})
 
     def _panelOrderList(self) -> QFrame:
         frame, body = panel("주문 목록")
@@ -584,7 +872,8 @@ class AdminDashboard(QMainWindow):
 
     # ── 패널: 상품별 재고 (SR-15) ────────────────────────────────
     def _panelStock(self) -> QFrame:
-        frame, body = panel("상품별 재고")
+        # 패널을 누르면 재고 관리 탭으로 넘어간다
+        frame, body = panel("상품별 재고", onClick=lambda: self._gotoMenu("재고 관리"))
         self._stockRow = QHBoxLayout()
         self._stockRow.setSpacing(12)
         body.addLayout(self._stockRow)
@@ -802,9 +1091,10 @@ class AdminDashboard(QMainWindow):
 
     # ── 서버 요청 ────────────────────────────────────────────────
     def _requestRefresh(self):
-        """주문/재고 재조회 (폴링 안전망 + push 뒤 재동기화)"""
+        """주문/재고/회원 재조회 (폴링 안전망 + push 뒤 재동기화)"""
         self._net.send({"cmd": "getAllOrders"})
         self._net.send({"cmd": "getProducts"})
+        self._net.send({"cmd": "getMembers"})
 
     def _scheduleResync(self):
         self._resyncTimer.start()   # 이미 돌고 있으면 타이머가 리셋됨(디바운스)
@@ -838,6 +1128,9 @@ class AdminDashboard(QMainWindow):
             "allOrdersData":     self._hAllOrders,
             "productList":        self._hProductList,
             "updateStockResult": self._hUpdateStockResult,
+            "memberData":         self._hMemberData,
+            "readCardResult":     self._hReadCardResult,
+            "registerCardResult": self._hRegisterCardResult,
             "resetTestDataResult": self._hResetTestDataResult,
             # push (broadcast)
             "dispatchStatus":     self._hDispatchStatus,
@@ -861,12 +1154,56 @@ class AdminDashboard(QMainWindow):
     def _hProductList(self, msg: dict):
         self._products = msg.get("items", [])
         self._refreshStock()
+        self._refreshStockAdmin()
 
     def _hUpdateStockResult(self, msg: dict):
         if msg.get("success"):
             self._scheduleResync()
         else:
             self._addAlert("재고 수정 실패", COL_DANGER)
+
+    def _hMemberData(self, msg: dict):
+        self._members = msg.get("members", [])
+        self._refreshMembers()
+
+    def _hReadCardResult(self, msg: dict):
+        self._readCardBtn.setEnabled(True)
+        if not msg.get("success"):
+            reason = msg.get("reason", "")
+            text = {
+                "noCard": "카드를 인식하지 못했습니다. 다시 시도해주세요",
+                "readerBusy": "리더기가 사용 중입니다. 잠시 후 다시 시도해주세요",
+                "cardTimeout": "시간이 초과되었습니다. 카드를 올리고 다시 시도해주세요",
+            }.get(reason, f"카드 읽기 실패 ({reason})")
+            self._setRegisterHint(text, COL_DANGER)
+            return
+        uid = msg.get("cardUid", "")
+        self._uidEdit.setText(uid)
+        if msg.get("registered"):
+            # 등록 버튼을 눌러봐야 duplicateCard 로 실패하니 미리 알려준다
+            self._setRegisterHint(
+                f"이미 등록된 카드입니다 — {msg.get('memberName') or '회원'} 님", COL_WARN)
+        else:
+            self._setRegisterHint(f"카드 UID {uid.upper()} · 이름을 입력하고 [등록]", COL_OK)
+
+    def _hRegisterCardResult(self, msg: dict):
+        self._registerBtn.setEnabled(True)
+        if not msg.get("success"):
+            reason = msg.get("reason", "")
+            text = {
+                "duplicateCard": "이미 등록된 카드입니다",
+                "noUid": "카드 UID 가 없습니다",
+                "noName": "이름을 입력해주세요",
+                "noMember": "회원 정보를 찾을 수 없습니다",
+            }.get(reason, f"카드 등록 실패 ({reason})")
+            self._setRegisterHint(text, COL_DANGER)
+            self._addAlert("카드 등록 실패", COL_DANGER)
+            return
+        self._setRegisterHint("카드를 등록했습니다", COL_OK)
+        self._addAlert("새 카드를 등록했습니다", COL_OK)
+        for edit in (self._uidEdit, self._nameEdit, self._contactEdit):
+            edit.clear()
+        self._net.send({"cmd": "getMembers"})
 
     def _hResetTestDataResult(self, msg: dict):
         if msg.get("success"):
