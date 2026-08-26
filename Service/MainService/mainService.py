@@ -56,10 +56,12 @@ ORDER_TIMEOUT = 60.0    # 출고 지시 후 아무 보고도 없으면 실패로
 # RFID 카드 태그를 이 시간 안에 안 하면 결제/충전 시도를 포기한다.
 PAYMENT_TIMEOUT = 15.0
 
-# 충전 한도. UI/CustomerDashboard/customerQt.py 의 같은 이름 상수와 값이 같아야
-# 화면에서 막는 금액과 서버가 막는 금액이 어긋나지 않는다.
-MAX_CHARGE_AMOUNT = 500_000     # 한 번에 충전할 수 있는 최대 금액
-MAX_CARD_BALANCE = 1_000_000    # 카드가 가질 수 있는 최대 잔액 (ST 는 uint32)
+# 충전 금액에 정책상 한도는 없다. 남은 건 물리적 한계 하나뿐 —
+# 카드 잔액은 ST 프레임의 4바이트(uint32, little-endian)로 실려 나간다.
+# 이걸 넘기면 serialModule._encode 의 to_bytes(4) 가 OverflowError 를 내는데,
+# send() 가 잡는 건 (KeyError, ValueError) 뿐이라 그대로 빠져나가 _pendingCharge
+# 가 ST 단계에 멈춘다 → 리더기가 타임아웃 15초 동안 묶인다. 쓰기 전에 걸러낸다.
+CARD_BALANCE_MAX = 0xFFFFFFFF   # 카드 잔액 필드(4바이트)가 담을 수 있는 최대값
 
 
 class Order:
@@ -293,7 +295,7 @@ class MainService:
                 amount = 0
             if not cardUid:
                 resp = {"cmd": "chargeResult", "success": False, "reason": "noCard"}
-            elif not 0 < amount <= MAX_CHARGE_AMOUNT:
+            elif amount <= 0:
                 resp = {"cmd": "chargeResult", "success": False, "reason": "invalidAmount"}
             elif self._readerBusy():
                 resp = {"cmd": "chargeResult", "success": False, "reason": "readerBusy"}
@@ -304,6 +306,12 @@ class MainService:
                 }
                 self.network.sendBoard({"cmd": "getCardStatus"})
                 print(f"[MS] 카드 {cardUid} {amount}원 충전 — 카드 재태그 대기")
+
+        elif cmd == "getSlots":
+            # 키오스크 홈 화면의 '찾아가실 물건' 표시용.
+            # 이후 변화는 pickupReady / slotReleased broadcast 로 따라간다 —
+            # 이 명령은 방금 켜졌거나 재접속한 클라이언트가 현재 상태를 맞추는 용도다.
+            resp = {"cmd": "slotData", "slots": self._slotSnapshot()}
 
         elif cmd == "getHistory":
             resp = {"cmd": "historyData",
@@ -555,6 +563,12 @@ class MainService:
                 return
             balance = msg["total"]
             newBalance = balance + pending["amount"]
+            if newBalance > CARD_BALANCE_MAX:
+                # 정책상 한도가 아니라 카드가 물리적으로 못 담는 금액이다.
+                print(f"[MS] 카드 잔액 필드 초과 (현재 {balance} + {pending['amount']} "
+                      f"> {CARD_BALANCE_MAX})")
+                self._failCharge("balanceLimit")
+                return
             pending["balanceBefore"] = balance
             pending["newBalance"] = newBalance
             pending["step"] = "ST"
@@ -648,6 +662,17 @@ class MainService:
         for item in order.items:
             byProduct[item["productId"]] = byProduct.get(item["productId"], 0) + item["qty"]
         return byProduct
+
+    def _slotSnapshot(self) -> list[dict]:
+        """픽업박스 현재 상태를 클라이언트가 그릴 수 있는 형태로 편다.
+
+        slotOccupied 의 -1 은 '서버가 모르는 물건이 놓여 있다' 는 뜻이라
+        occupied=True / orderId=None 으로 내보낸다(칸은 찼지만 주문 연결은 없음).
+        """
+        return [{"slot": slot,
+                 "occupied": held is not None,
+                 "orderId": held if isinstance(held, int) and held > 0 else None}
+                for slot, held in sorted(self.slotOccupied.items())]
 
     def _pickFreeSlot(self) -> int | None:
         """놓을 픽업박스를 서버가 정한다.
