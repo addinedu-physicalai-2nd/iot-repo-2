@@ -374,6 +374,17 @@ class MainService:
             self._releaseBoard()
             self._onOrderFailed(msg["orderId"], msg)
             self._pumpDispatch()
+        elif event == "orderRejected":
+            # 보드가 '지금 바쁘다' 며 거절했다 — 아무것도 안 나갔으니 전부 되돌린다.
+            # (처리를 안 하면 ORDER_TIMEOUT 60초를 기다렸다가 배출 개수 불명으로
+            #  끝나서, 실제로는 선반에 그대로 있는 물건의 재고가 깎인 채 남는다)
+            if self._isStale(msg, "orderRejected"):
+                return
+            self._releaseBoard()
+            self._onOrderFailed(msg["orderId"],
+                                {"reason": msg.get("reason", FailReason.BUSY),
+                                 "dispensed": [0] * len(DISPENSER_PRODUCTS)})
+            self._pumpDispatch()
         elif event in ("boardConnected", "boardDisconnected"):
             self._onBoardLost(boardName, event)
         elif event == "slotState":
@@ -627,10 +638,16 @@ class MainService:
 
     def _buildCounts(self, order: Order) -> list[int]:
         """order.items 를 DISPENSER_PRODUCTS 순서의 개수 3개로 편다."""
-        byProduct = {}
+        byProduct = self._orderCounts(order)
+        return [byProduct.get(pid, 0) for pid in DISPENSER_PRODUCTS]
+
+    @staticmethod
+    def _orderCounts(order: Order) -> dict[int, int]:
+        """주문한 개수를 productId -> qty 로 모은다(같은 상품이 여러 줄이면 합친다)."""
+        byProduct: dict[int, int] = {}
         for item in order.items:
             byProduct[item["productId"]] = byProduct.get(item["productId"], 0) + item["qty"]
-        return [byProduct.get(pid, 0) for pid in DISPENSER_PRODUCTS]
+        return byProduct
 
     def _pickFreeSlot(self) -> int | None:
         """놓을 픽업박스를 서버가 정한다.
@@ -651,6 +668,11 @@ class MainService:
             return
         order.setStatus(OrderStatus.PICKUP_READY)
         print(f"[MS] 주문 {orderId} 출고 완료 (배출 {dispensed}) slot={order.assignedSlot}")
+        # 완료인데 개수가 모자라면 보드와 서버의 셈이 어긋난 것이다. 재고를 함부로
+        # 건드리진 않고(손님은 이미 물건을 받으러 간다) 눈에 띄게 남긴다.
+        if dispensed is not None and list(dispensed) != self._buildCounts(order):
+            print(f"[MS] ★ 주문 {orderId} 배출 개수 불일치: "
+                  f"주문 {self._buildCounts(order)} / 배출 {list(dispensed)}")
         self.network.broadcastTcp(
             {"cmd": "pickupReady", "orderId": orderId, "slot": order.assignedSlot})
         self.network.broadcastTcp(
@@ -663,6 +685,9 @@ class MainService:
         order.setStatus(OrderStatus.ERROR)
         reason = msg.get("reason", FailReason.UNKNOWN)
         print(f"[MS] 주문 {orderId} 출고 실패: {reason} (배출 {msg.get('dispensed')})")
+        # ★ 재고는 createOrder 때 이미 깎여 있다. 안 나간 몫은 여기서 되돌려야
+        #   실제로 선반에 남아있는 물건이 영영 안 팔리는 재고가 된다.
+        self._restoreUndispensed(order, msg.get("dispensed"))
         # 선점했던 슬롯을 되돌린다
         slot = order.assignedSlot
         if slot in self.slotOccupied and self.slotOccupied[slot] == orderId:
@@ -675,6 +700,41 @@ class MainService:
              "message": f"주문 {orderId} 출고 실패 ({reason})"})
         if slot is not None:
             self.network.broadcastTcp({"cmd": "slotReleased", "slot": slot})
+
+    def _restoreUndispensed(self, order: Order, dispensed: list[int] | None):
+        """출고 실패 — 주문한 개수에서 실제 배출된 개수를 뺀 만큼 재고를 되돌린다.
+
+        보드가 dispensed(실제 배출 개수)를 같이 보고하므로 부분 배출도 정확히
+        맞출 수 있다. 예: 2개 주문했는데 1개만 나오고 잼 → 1개만 되돌린다.
+
+        ★ dispensed 가 없으면(보드 무응답/리셋) 몇 개가 나갔는지 알 수 없다.
+          짐작으로 되돌리면 없는 재고를 파는 꼴이 되니 자동 복구를 하지 않고
+          관리자에게 알린다(관리자 화면의 재고 수정으로 맞춘다).
+        """
+        ordered = self._orderCounts(order)
+        if dispensed is None:
+            print(f"[MS] 주문 {order.orderId} 배출 개수 불명 — 재고 {ordered} 자동 복구 안 함. "
+                  f"관리자 화면에서 실물 재고를 확인해야 한다")
+            self.network.broadcastTcp({
+                "cmd": "alert", "level": "warn", "orderId": order.orderId,
+                "message": f"주문 {order.orderId} 배출 개수를 알 수 없습니다 — 재고를 확인해주세요"})
+            return
+
+        # dispensed 는 DISPENSER_PRODUCTS 순서다(startOrder 의 counts 와 같은 순서).
+        dispensedBy = {pid: dispensed[idx]
+                       for idx, pid in enumerate(DISPENSER_PRODUCTS)
+                       if idx < len(dispensed)}
+        items = []
+        for productId, qty in ordered.items():
+            # 배출구에 없는 상품이면 애초에 나갈 수가 없으니 주문한 만큼 그대로 되돌린다
+            left = qty - dispensedBy.get(productId, 0)
+            if left > 0:
+                items.append({"productId": productId, "qty": left})
+        if not items:
+            print(f"[MS] 주문 {order.orderId} 되돌릴 재고 없음 (전부 배출됨)")
+            return
+        self.db.restoreStock(items)
+        print(f"[MS] 주문 {order.orderId} 미배출 재고 복구: {items}")
 
     def _isStale(self, msg: dict, event: str) -> bool:
         """지금 물고 있는 주문의 보고가 맞는지 대조한다.

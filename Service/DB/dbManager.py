@@ -197,6 +197,25 @@ class DBManager:
             cur.execute("DELETE FROM order_item WHERE order_id = %s", (orderId,))
             cur.execute("DELETE FROM orders WHERE id = %s", (orderId,))
 
+    def restoreStock(self, items):
+        """createOrder 가 미리 깎아둔 재고 중 실제로 안 나간 몫을 되돌린다.
+
+        cancelOrder 와 달리 주문 행은 남긴다 — 출고 실패는 '없던 일' 이 아니라
+        기록에 남아야 하는 사고라서(관리자 화면에 오류 주문으로 뜬다).
+        items 예: [{"productId": 1, "qty": 2}, ...]
+        """
+        if not items:
+            return
+        conn = self._connect()
+        with conn.cursor() as cur:
+            for item in items:
+                if item["qty"] <= 0:
+                    continue
+                cur.execute(
+                    "UPDATE product SET stock = stock + %s WHERE id = %s",
+                    (item["qty"], item["productId"]),
+                )
+
     def confirmPayment(self, orderId, balanceBefore, balanceAfter):
         """결제 확정 표시 (paidAt/차감 전후 잔액 기록 + status).
         재고는 createOrder에서 이미 처리했음."""
