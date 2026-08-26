@@ -53,8 +53,13 @@ SLOT_COUNT = 3
 # 보드가 통째로 뻗어도 주문이 갇히지 않게 하는 안전망.
 ORDER_TIMEOUT = 60.0    # 출고 지시 후 아무 보고도 없으면 실패로 정리한다
 
-# RFID 카드 태그를 이 시간 안에 안 하면 결제 시도를 포기한다.
+# RFID 카드 태그를 이 시간 안에 안 하면 결제/충전 시도를 포기한다.
 PAYMENT_TIMEOUT = 15.0
+
+# 충전 한도. UI/CustomerDashboard/customerQt.py 의 같은 이름 상수와 값이 같아야
+# 화면에서 막는 금액과 서버가 막는 금액이 어긋나지 않는다.
+MAX_CHARGE_AMOUNT = 500_000     # 한 번에 충전할 수 있는 최대 금액
+MAX_CARD_BALANCE = 1_000_000    # 카드가 가질 수 있는 최대 잔액 (ST 는 uint32)
 
 
 class Order:
@@ -155,6 +160,9 @@ class MainService:
         # 결제 확인 — GS 로 같은 카드인지 대조한 뒤 GT→ST 로 잔액 차감.
         # {"orderId", "clientId", "step": "GS"/"GT"/"ST", "since", ["newBalance"]}
         self._pendingPayment: dict | None = None
+        # 충전 — 결제와 같은 GS→GT→ST 지만 빼는 대신 더한다. 주문과 무관하다.
+        # {"cardUid", "amount", "clientId", "step": "GS"/"GT"/"ST", "since", ...}
+        self._pendingCharge: dict | None = None
 
         self.network = NetworkManager(
             self.inQueue,
@@ -275,6 +283,28 @@ class MainService:
                 self.network.sendBoard({"cmd": "getCardStatus"})
                 print(f"[CC] 주문 {orderId} 결제 확인 — 카드 재태그 대기")
 
+        elif cmd == "chargeCard":
+            # 충전도 카드에 직접 쓰는 일이라 결제와 똑같이 카드를 다시 태그받는다.
+            # (잔액은 DB 가 아니라 카드 안에 있다 — GT 로 읽고 ST 로 되쓴다)
+            cardUid = (msg.get("cardUid") or "").lower()
+            try:
+                amount = int(msg.get("amount") or 0)
+            except (TypeError, ValueError):
+                amount = 0
+            if not cardUid:
+                resp = {"cmd": "chargeResult", "success": False, "reason": "noCard"}
+            elif not 0 < amount <= MAX_CHARGE_AMOUNT:
+                resp = {"cmd": "chargeResult", "success": False, "reason": "invalidAmount"}
+            elif self._readerBusy():
+                resp = {"cmd": "chargeResult", "success": False, "reason": "readerBusy"}
+            else:
+                self._pendingCharge = {
+                    "cardUid": cardUid, "amount": amount, "clientId": clientId,
+                    "step": "GS", "since": time.monotonic(),
+                }
+                self.network.sendBoard({"cmd": "getCardStatus"})
+                print(f"[CC] 카드 {cardUid} {amount}원 충전 — 카드 재태그 대기")
+
         elif cmd == "getHistory":
             resp = {"cmd": "historyData",
                     "orders": self.db.getOrdersByCard(msg["cardUid"])}
@@ -357,8 +387,10 @@ class MainService:
             print(f"[CC] 미처리 보드 이벤트 ({boardName}): {msg}")
 
     def _readerBusy(self) -> bool:
-        """카드 리더기가 하나뿐이라 카드 태그/결제 확인을 동시에 못 한다."""
-        return self._pendingCardTag is not None or self._pendingPayment is not None
+        """카드 리더기가 하나뿐이라 카드 태그/결제 확인/충전을 동시에 못 한다."""
+        return (self._pendingCardTag is not None
+                or self._pendingPayment is not None
+                or self._pendingCharge is not None)
 
     # ── RFID 응답 라우팅: 카드 태그(주문 시작) vs 결제 확인 중 진행 중인 쪽으로 ──
     def _onRfidResponse(self, msg: dict):
@@ -366,7 +398,9 @@ class MainService:
             self._onCardTagResponse(msg)
         elif self._pendingPayment is not None:
             self._onPaymentRfidResponse(msg)
-        # 둘 다 없으면 늦게 온 응답 등 — 무시
+        elif self._pendingCharge is not None:
+            self._onChargeRfidResponse(msg)
+        # 셋 다 없으면 늦게 온 응답 등 — 무시
 
     # ── 카드 태그 (tagCard — 상품 고르기 전, card/member 확인 + 잔액을 읽어온다) ──
     def _onCardTagResponse(self, msg: dict):
@@ -481,6 +515,66 @@ class MainService:
         self.network.sendTo(pending["clientId"], {
             "cmd": "paymentResult", "orderId": pending["orderId"],
             "status": "fail", "reason": reason})
+
+    # ── 충전 (chargeCard 가 시작해서 GS→GT→ST 순으로 진행) ──────
+    def _onChargeRfidResponse(self, msg: dict):
+        pending = self._pendingCharge
+        if msg.get("cmd") != pending["step"]:
+            return  # 우리가 기다리던 응답이 아니다(늦게 온 응답 등) — 무시
+
+        if pending["step"] == "GS":
+            if not msg.get("ok"):
+                self._failCharge("noCard")
+                return
+            tagged = (msg.get("uid") or "").lower()
+            if pending["cardUid"] != tagged:
+                # 잔액을 보여준 카드와 지금 올려둔 카드가 다르다 — 남의 카드에
+                # 충전되는 걸 막는다. (uid 는 항상 소문자 hex 로 비교)
+                print(f"[CC] 충전 카드 불일치 (조회 카드 {pending['cardUid']} / "
+                      f"태그된 카드 {tagged})")
+                self._failCharge("cardMismatch")
+                return
+            pending["cardUid"] = tagged   # 리더기가 준 값이 항상 올바른 hex 다
+            pending["step"] = "GT"
+            self.network.sendBoard({"cmd": "getCardBalance", "uid": tagged})
+
+        elif pending["step"] == "GT":
+            if not msg.get("ok"):
+                self._failCharge("cardReadError")
+                return
+            balance = msg["total"]
+            newBalance = balance + pending["amount"]
+            pending["balanceBefore"] = balance
+            pending["newBalance"] = newBalance
+            pending["step"] = "ST"
+            self.network.sendBoard({"cmd": "setCardBalance",
+                                     "uid": pending["cardUid"], "total": newBalance})
+
+        elif pending["step"] == "ST":
+            if not msg.get("ok"):
+                # 카드에 실제로는 안 써졌다 — 손님 돈이 사라지면 안 되니 실패로 알린다.
+                self._failCharge("cardWriteError")
+                return
+            self._completeCharge()
+
+    def _completeCharge(self):
+        pending = self._pendingCharge
+        self._pendingCharge = None
+        print(f"[CC] 카드 {pending['cardUid']} 충전 완료 "
+              f"({pending['balanceBefore']} → {pending['newBalance']})")
+        self.network.sendTo(pending["clientId"], {
+            "cmd": "chargeResult", "success": True,
+            "cardUid": pending["cardUid"], "amount": pending["amount"],
+            "balance": pending["newBalance"]})
+
+    def _failCharge(self, reason: str):
+        pending = self._pendingCharge
+        self._pendingCharge = None
+        if pending is None:
+            return
+        print(f"[CC] 카드 {pending['cardUid']} 충전 실패: {reason}")
+        self.network.sendTo(pending["clientId"], {
+            "cmd": "chargeResult", "success": False, "reason": reason})
 
     # ── 출고 시퀀스 ──────────────────────────────────────────────
     # 서버는 '무엇을 몇 개, 어느 슬롯에' 만 정해서 분배 보드에 한 번 보낸다.
@@ -616,6 +710,12 @@ class MainService:
                 and now - self._pendingPayment["since"] > PAYMENT_TIMEOUT):
             print(f"[CC] 결제 {PAYMENT_TIMEOUT:.0f}초 무응답 — 결제 정리")
             self._failPayment("cardTimeout")
+
+        # 충전도 카드를 안 올리면 리더기를 붙잡고 있게 되니 같이 정리한다.
+        if (self._pendingCharge is not None
+                and now - self._pendingCharge["since"] > PAYMENT_TIMEOUT):
+            print(f"[CC] 충전 {PAYMENT_TIMEOUT:.0f}초 무응답 — 충전 정리")
+            self._failCharge("cardTimeout")
 
         # 주문 시작용 카드 태그도 마찬가지로 무한 대기하지 않게 한다.
         if (self._pendingCardTag is not None

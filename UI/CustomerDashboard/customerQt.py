@@ -5,13 +5,22 @@ customerQt.py — 고객용 무인매장 키오스크 (PyQt6)
   관리자 화면과 같은 서비스를 쓰되, 영상은 쓰지 않아 제어 채널만 연다.
 
 화면 흐름:
-  0. 카드 태그  → [카드 태그하기]  (상품 고르기 전에 먼저 태그 — cardUid 확보)
-  1. 상품 선택 → 수량 담기 → [주문하기]
-  2. 결제      → [카드 결제]        (여기서 같은 카드를 다시 태그해서 확인+차감)
-  3. 진행/완료 → 출고중 … "N번 함에서 찾아가세요" … 감사합니다 → 처음(카드 태그)으로
+  0. 홈        → [충전] / [상품 구매] 두 박스 중 하나를 고른다
+  1. 카드 태그 → [카드 태그하기]  (두 흐름 모두 여기서 cardUid·잔액을 확보)
+       ├ 충전 흐름   → 2. 충전    (잔액 확인 → 금액 입력 → 충전 → 홈)
+       └ 구매 흐름   → 3. 상품 선택 → 4. 결제 → 5. 진행/완료 → 홈
+  3. 상품 선택 → 수량 담기 → [주문하기]
+  4. 결제      → [카드 결제]        (여기서 같은 카드를 다시 태그해서 확인+차감)
+  5. 진행/완료 → 출고중 … "N번 함에서 찾아가세요" → 홈으로 (픽업을 안 기다린다)
+
+★ 픽업박스가 3개인 건 '앞 손님이 찾아가기 전에도 다음 주문을 받기' 위해서다.
+  그래서 화면은 출고 완료(pickupReady)에서 손을 떼고, 실제 픽업(dispatchStatus
+  DONE)은 서버와 픽업 보드가 알아서 끝낸다. 홈으로 돌아간 뒤 오는 내 주문의
+  push 는 _orderId 가 이미 None 이라 자연히 걸러진다.
 
 주고받는 명령:
   → tagCard        ← cardTagResult (성공 시 cardUid)
+  → chargeCard     ← chargeResult   (같은 카드를 다시 태그해서 확인+충전)
   → getProducts    ← productList
   → createOrder    ← orderCreated   (실패 시 reason: outOfStock)
   → requestPayment ← paymentResult  (카드가 바뀌면 reason: cardMismatch,
@@ -21,7 +30,8 @@ customerQt.py — 고객용 무인매장 키오스크 (PyQt6)
 ★ push 는 모든 Qt 클라이언트에게 broadcast 된다.
   다른 손님 주문까지 날아오므로 반드시 내 orderId 인지 걸러야 한다.
 
-member 테이블은 없다. 주문은 RFID 카드 UID(cardUid)로 식별한다.
+카드 잔액은 DB 가 아니라 RFID 카드 자체에 들어있다. 충전도 결제와 똑같이
+리더기에 카드를 올려둔 채로 진행된다(서버가 GS→GT→ST 로 다시 쓴다).
 
 실행:  python customerQt.py [--host 127.0.0.1] [--port 9000]
 """
@@ -37,9 +47,10 @@ sys.path.insert(0, str(_REPO_ROOT))
 
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QLabel, QPushButton, QFrame,
-    QVBoxLayout, QHBoxLayout, QStackedWidget,
+    QVBoxLayout, QHBoxLayout, QStackedWidget, QLineEdit,
 )
 from PyQt6.QtCore import Qt, QTimer
+from PyQt6.QtGui import QIntValidator
 
 from Library.protocol import OrderStatus
 from qtService import QtService
@@ -49,7 +60,35 @@ from UI.theme import (
 )
 
 STOCK_POLL_MS = 8000      # 다른 손님이 사가면 재고가 줄어드니 주기적으로 다시 본다
-DONE_RESET_MS = 6000      # 완료 화면을 보여준 뒤 처음으로 돌아가기까지
+
+# ★ 픽업박스가 3개인 이유가 '먼저 산 손님이 찾아가기 전에도 다음 주문을 받는' 것이다.
+#   그래서 손님이 물건을 꺼낼 때(dispatchStatus DONE)까지 기다리지 않고,
+#   출고가 끝나 함에 물건이 놓인 시점(pickupReady)에 화면을 놓아준다.
+#   서버는 원래부터 3건 동시 진행이 됐고(boardReady 는 출고 완료 때 풀린다),
+#   막고 있던 건 이 화면뿐이었다.
+PICKUP_RESET_MS = 10000   # "N번 함에서 찾아가세요" 를 보여준 뒤 홈으로
+DONE_RESET_MS = 4000      # 손님이 그 자리에서 바로 꺼낸 경우(감사합니다) 홈으로
+ERROR_RESET_MS = 20000    # 출고 실패 화면에서 홈으로 — 키오스크가 갇히지 않게
+
+# ── 화면 번호 (QStackedWidget 인덱스) ────────────────────────────
+PAGE_HOME = 0
+PAGE_TAG = 1
+PAGE_CHARGE = 2
+PAGE_SELECT = 3
+PAGE_PAY = 4
+PAGE_PROGRESS = 5
+
+# ── 카드 태그 후 어디로 갈지 ─────────────────────────────────────
+FLOW_CHARGE = "charge"
+FLOW_PURCHASE = "purchase"
+
+# 충전 한도. 서버(mainService.MAX_CHARGE_AMOUNT / MAX_CARD_BALANCE)와 같은 값이어야
+# 화면에서 막은 금액과 서버가 막는 금액이 어긋나지 않는다.
+MAX_CHARGE_AMOUNT = 500_000     # 한 번에 충전할 수 있는 최대 금액
+MAX_CARD_BALANCE = 1_000_000    # 카드가 가질 수 있는 최대 잔액
+QUICK_AMOUNTS = (1_000, 5_000, 10_000, 50_000)
+
+LIMIT_MESSAGE = f"카드 최대 잔액은 {MAX_CARD_BALANCE:,}원입니다"
 
 
 def bigButton(text: str, primary: bool = True) -> QPushButton:
@@ -70,6 +109,62 @@ def bigButton(text: str, primary: bool = True) -> QPushButton:
             "padding:0 28px;}"
             f"QPushButton:hover{{background:{COL_PANEL};color:{COL_TEXT};}}")
     return btn
+
+
+class HomeBox(QFrame):
+    """홈 화면의 큰 선택 박스. 박스 아무 데나 누르면 onClick 이 불린다."""
+
+    def __init__(self, icon: str, title: str, desc: str, onClick):
+        super().__init__()
+        self._onClick = onClick
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        # QLabel 도 QFrame 상속이라 QFrame{...} 로 쓰면 자식 라벨까지 테두리가 생긴다.
+        # objectName 으로 이 박스만 겨냥한다.
+        self.setObjectName("homeBox")
+        self._paint(False)
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(24, 36, 24, 36)
+        lay.setSpacing(12)
+        lay.addStretch(1)
+
+        iconLabel = QLabel(icon)
+        iconLabel.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        iconLabel.setStyleSheet("background:transparent;font-size:72px;")
+        lay.addWidget(iconLabel)
+
+        titleLabel = QLabel(title)
+        titleLabel.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        titleLabel.setStyleSheet(f"background:transparent;color:{COL_TEXT};"
+                                 "font-size:34px;font-weight:800;")
+        lay.addWidget(titleLabel)
+
+        descLabel = QLabel(desc)
+        descLabel.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        descLabel.setWordWrap(True)
+        descLabel.setStyleSheet(f"background:transparent;color:{COL_SUBTLE};font-size:18px;")
+        lay.addWidget(descLabel)
+        lay.addStretch(1)
+
+    def _paint(self, hover: bool):
+        border = COL_SIDE_SEL if hover else COL_LINE
+        background = COL_PANEL_HDR if hover else COL_PANEL
+        self.setStyleSheet(
+            f"QFrame#homeBox{{background:{background};"
+            f"border:2px solid {border};border-radius:20px;}}")
+
+    def enterEvent(self, event):
+        self._paint(True)
+        super().enterEvent(event)
+
+    def leaveEvent(self, event):
+        self._paint(False)
+        super().leaveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._onClick()
+        super().mouseReleaseEvent(event)
 
 
 class ProductCard(QFrame):
@@ -171,12 +266,14 @@ class CustomerKiosk(QMainWindow):
 
         self._products: list[dict] = []
         self._cards: dict[int, ProductCard] = {}    # productId -> 카드
+        self._flow: str | None = None                # 카드 태그 후 갈 곳 (충전/구매)
         self._cardId: int | None = None              # 카드 태그로 얻은 카드 id (주문 생성에 씀)
         self._cardUid: str | None = None             # 카드 물리 UID (표시/서버가 재확인용)
         self._memberName: str | None = None          # 헤더에 표시할 회원 이름
         self._cardBalance: int | None = None         # 헤더에 표시할 카드 잔액
         self._orderId: int | None = None            # 내 주문. push 를 거를 기준
         self._orderTotal = 0
+        self._chargePending = False                  # 충전 응답 대기 중 (중복 요청 방지)
 
         root = QWidget()
         self.setCentralWidget(root)
@@ -186,10 +283,12 @@ class CustomerKiosk(QMainWindow):
 
         outer.addLayout(self._buildHeader())
         self._stack = QStackedWidget()
-        self._stack.addWidget(self._pageCardTag())
-        self._stack.addWidget(self._pageSelect())
-        self._stack.addWidget(self._pagePay())
-        self._stack.addWidget(self._pageProgress())
+        self._stack.addWidget(self._pageHome())       # PAGE_HOME
+        self._stack.addWidget(self._pageCardTag())    # PAGE_TAG
+        self._stack.addWidget(self._pageCharge())     # PAGE_CHARGE
+        self._stack.addWidget(self._pageSelect())     # PAGE_SELECT
+        self._stack.addWidget(self._pagePay())        # PAGE_PAY
+        self._stack.addWidget(self._pageProgress())   # PAGE_PROGRESS
         outer.addWidget(self._stack, 1)
         outer.addWidget(self._statusBar())
 
@@ -200,10 +299,22 @@ class CustomerKiosk(QMainWindow):
         self._net.message.connect(self._onMessage)
 
         self._pollTimer = QTimer(self)
-        self._pollTimer.timeout.connect(self._requestProducts)
+        self._pollTimer.timeout.connect(self._pollProducts)
         self._pollTimer.start(STOCK_POLL_MS)
 
+        # 진행 화면에서 홈으로 자동 복귀시키는 타이머.
+        # singleShot 을 그때그때 걸면 취소를 못 해서 겹쳐 터진다 — 하나만 두고 재시작한다.
+        self._homeTimer = QTimer(self)
+        self._homeTimer.setSingleShot(True)
+        self._homeTimer.timeout.connect(self._goHome)
+        self._countdownTimer = QTimer(self)
+        self._countdownTimer.setInterval(1000)
+        self._countdownTimer.timeout.connect(self._tickCountdown)
+        self._homeLeft = 0
+        self._homeSub = ""
+
         self._setServerStatus(False)
+        self._showPage(PAGE_HOME, "무엇을 도와드릴까요?")
         self._net.start()
 
     # ── 상단 ─────────────────────────────────────────────────────
@@ -214,7 +325,7 @@ class CustomerKiosk(QMainWindow):
         self._balanceLabel = QLabel("")   # 카드 태그 전엔 비어있음
         self._balanceLabel.setStyleSheet(
             f"color:{COL_OK};font-size:18px;font-weight:700;")
-        self._title = QLabel("카드를 태그해주세요")
+        self._title = QLabel("무엇을 도와드릴까요?")
         self._title.setStyleSheet(f"color:{COL_SUBTLE};font-size:18px;")
         bar.addWidget(logo)
         bar.addStretch(1)
@@ -236,7 +347,41 @@ class CustomerKiosk(QMainWindow):
             parts.append(f"잔액 {self._cardBalance:,}원")
         self._balanceLabel.setText(" · ".join(parts))
 
-    # ── 화면 0: 카드 태그 (상품 고르기 전에 cardUid 를 확보) ──────
+    # ── 화면 0: 홈 (충전 / 상품 구매) ────────────────────────────
+    def _pageHome(self) -> QWidget:
+        page = QWidget()
+        lay = QVBoxLayout(page)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(18)
+
+        head = QLabel("원하시는 메뉴를 선택해주세요")
+        head.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        head.setStyleSheet(f"color:{COL_TEXT};font-size:30px;font-weight:800;")
+        lay.addWidget(head)
+
+        row = QHBoxLayout()
+        row.setSpacing(24)
+        row.addWidget(HomeBox("💰", "충전", "카드에 금액을 채웁니다",
+                              lambda: self._startFlow(FLOW_CHARGE)), 1)
+        row.addWidget(HomeBox("🛒", "상품 구매", "상품을 고르고 카드로 결제합니다",
+                              lambda: self._startFlow(FLOW_PURCHASE)), 1)
+        lay.addLayout(row, 1)
+        return page
+
+    def _startFlow(self, flow: str):
+        """홈에서 충전/구매를 고르면 둘 다 카드 태그 화면부터 시작한다."""
+        self._flow = flow
+        self._tagBtn.setEnabled(True)
+        self._tagHint.setStyleSheet(f"color:{COL_SUBTLE};font-size:16px;")
+        self._tagHint.setText("")
+        if flow == FLOW_CHARGE:
+            self._tagMain.setText("충전할 카드를 태그해주세요")
+            self._showPage(PAGE_TAG, "충전 — 카드 태그")
+        else:
+            self._tagMain.setText("결제할 카드를 태그해주세요")
+            self._showPage(PAGE_TAG, "상품 구매 — 카드 태그")
+
+    # ── 화면 1: 카드 태그 (충전·구매 둘 다 여기서 cardUid 를 확보) ──
     def _pageCardTag(self) -> QWidget:
         page = QWidget()
         lay = QVBoxLayout(page)
@@ -248,11 +393,11 @@ class CustomerKiosk(QMainWindow):
         icon.setStyleSheet("font-size:64px;")
         lay.addWidget(icon)
 
-        main = QLabel("카드를 태그해주세요")
-        main.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        main.setWordWrap(True)
-        main.setStyleSheet(f"color:{COL_TEXT};font-size:32px;font-weight:800;")
-        lay.addWidget(main)
+        self._tagMain = QLabel("카드를 태그해주세요")
+        self._tagMain.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._tagMain.setWordWrap(True)
+        self._tagMain.setStyleSheet(f"color:{COL_TEXT};font-size:32px;font-weight:800;")
+        lay.addWidget(self._tagMain)
 
         self._tagHint = QLabel("")
         self._tagHint.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -262,8 +407,12 @@ class CustomerKiosk(QMainWindow):
         lay.addSpacing(24)
         self._tagBtn = bigButton("카드 태그하기")
         self._tagBtn.clicked.connect(self._requestCardTag)
+        tagBack = bigButton("처음으로", primary=False)
+        tagBack.clicked.connect(self._goHome)
         btnRow = QHBoxLayout()
+        btnRow.setSpacing(14)
         btnRow.addStretch(1)
+        btnRow.addWidget(tagBack)
         btnRow.addWidget(self._tagBtn)
         btnRow.addStretch(1)
         lay.addLayout(btnRow)
@@ -276,7 +425,168 @@ class CustomerKiosk(QMainWindow):
         self._tagHint.setText("카드를 리더기에 올려주세요…")
         self._net.send({"cmd": "tagCard"})
 
-    # ── 화면 1: 상품 선택 ────────────────────────────────────────
+    # ── 화면 2: 충전 ─────────────────────────────────────────────
+    def _pageCharge(self) -> QWidget:
+        page = QWidget()
+        lay = QVBoxLayout(page)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(16)
+
+        box = QFrame()
+        box.setObjectName("chargeBox")
+        box.setStyleSheet(
+            f"QFrame#chargeBox{{background:{COL_PANEL};"
+            f"border:1px solid {COL_LINE};border-radius:14px;}}")
+        boxLay = QVBoxLayout(box)
+        boxLay.setContentsMargins(28, 24, 28, 24)
+        boxLay.setSpacing(14)
+
+        self._chargeOwner = QLabel("")
+        self._chargeOwner.setStyleSheet(f"background:transparent;color:{COL_SUBTLE};"
+                                        "font-size:18px;font-weight:600;")
+        boxLay.addWidget(self._chargeOwner)
+
+        boxLay.addLayout(self._chargeRow("현재 잔액", "_curBalanceLabel",
+                                         COL_TEXT, 32))
+
+        amountCap = QLabel("충전할 금액")
+        amountCap.setStyleSheet(f"background:transparent;color:{COL_SUBTLE};font-size:18px;")
+        boxLay.addWidget(amountCap)
+
+        self._amountEdit = QLineEdit()
+        self._amountEdit.setPlaceholderText("0")
+        self._amountEdit.setAlignment(Qt.AlignmentFlag.AlignRight)
+        self._amountEdit.setValidator(QIntValidator(0, MAX_CHARGE_AMOUNT, self))
+        self._amountEdit.setMinimumHeight(64)
+        self._amountEdit.setStyleSheet(
+            f"QLineEdit{{background:{COL_BG};color:{COL_TEXT};"
+            f"border:1px solid {COL_LINE};border-radius:12px;"
+            "font-size:32px;font-weight:800;padding:0 18px;}")
+        self._amountEdit.textChanged.connect(self._refreshChargeTotal)
+        boxLay.addWidget(self._amountEdit)
+
+        quickRow = QHBoxLayout()
+        quickRow.setSpacing(10)
+        for amount in QUICK_AMOUNTS:
+            btn = self._quickButton(f"+{amount:,}")
+            btn.clicked.connect(lambda _, a=amount: self._addAmount(a))
+            quickRow.addWidget(btn, 1)
+        clearBtn = self._quickButton("지우기")
+        clearBtn.clicked.connect(lambda: self._amountEdit.setText(""))
+        quickRow.addWidget(clearBtn, 1)
+        boxLay.addLayout(quickRow)
+
+        boxLay.addStretch(1)
+        boxLay.addLayout(self._chargeRow("충전 후 잔액", "_finalBalanceLabel",
+                                         COL_OK, 38))
+        lay.addWidget(box, 1)
+
+        self._chargeHint = QLabel("")
+        self._chargeHint.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._chargeHint.setStyleSheet(f"color:{COL_DANGER};font-size:17px;")
+        lay.addWidget(self._chargeHint)
+
+        row = QHBoxLayout()
+        row.setSpacing(14)
+        self._chargeHomeBtn = bigButton("처음으로", primary=False)
+        self._chargeHomeBtn.clicked.connect(self._goHome)
+        self._chargeBtn = bigButton("충전하기")
+        self._chargeBtn.clicked.connect(self._submitCharge)
+        row.addWidget(self._chargeHomeBtn, 1)
+        row.addWidget(self._chargeBtn, 2)
+        lay.addLayout(row)
+        return page
+
+    def _chargeRow(self, caption: str, attr: str, color: str, size: int) -> QHBoxLayout:
+        """'현재 잔액 ........ 12,000원' 같은 한 줄. 값 라벨을 attr 이름으로 달아둔다."""
+        row = QHBoxLayout()
+        cap = QLabel(caption)
+        cap.setStyleSheet(f"background:transparent;color:{COL_SUBTLE};font-size:18px;")
+        value = QLabel("-")
+        value.setAlignment(Qt.AlignmentFlag.AlignRight)
+        value.setStyleSheet(f"background:transparent;color:{color};"
+                            f"font-size:{size}px;font-weight:800;")
+        setattr(self, attr, value)
+        row.addWidget(cap)
+        row.addStretch(1)
+        row.addWidget(value)
+        return row
+
+    def _quickButton(self, text: str) -> QPushButton:
+        btn = QPushButton(text)
+        btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn.setMinimumHeight(54)
+        btn.setStyleSheet(
+            f"QPushButton{{background:{COL_PANEL_HDR};color:{COL_TEXT};border:none;"
+            "border-radius:12px;font-size:18px;font-weight:700;}"
+            f"QPushButton:hover{{background:{COL_LINE};}}")
+        return btn
+
+    def _chargeAmount(self) -> int:
+        text = self._amountEdit.text().strip()
+        return int(text) if text.isdigit() else 0
+
+    def _addAmount(self, delta: int):
+        amount = min(self._chargeAmount() + delta, MAX_CHARGE_AMOUNT)
+        self._amountEdit.setText(str(amount))
+
+    def _enterCharge(self):
+        """카드 태그가 끝나고 충전 화면으로 들어올 때 한 번."""
+        owner = f"{self._memberName}님의 카드" if self._memberName else "카드"
+        self._chargeOwner.setText(f"{owner} · {self._cardUid or '-'}")
+        self._chargePending = False
+        self._amountEdit.setText("")
+        self._chargeHint.setText("")
+        self._chargeBtn.setText("충전하기")
+        self._refreshChargeTotal()
+        self._showPage(PAGE_CHARGE, "충전")
+
+    def _refreshChargeTotal(self):
+        """현재 잔액·충전 후 잔액 표시와 [충전하기] 활성 여부를 다시 계산한다."""
+        balance = self._cardBalance
+        amount = self._chargeAmount()
+        self._curBalanceLabel.setText("-" if balance is None else f"{balance:,}원")
+        if balance is None:
+            # 잔액을 못 읽으면 충전 후 금액을 보여줄 수 없다(서버도 GT 부터 다시 한다).
+            self._finalBalanceLabel.setText("-")
+            self._chargeBtn.setEnabled(False)
+            return
+        self._finalBalanceLabel.setText(f"{balance + amount:,}원")
+        overLimit = balance + amount > MAX_CARD_BALANCE
+        if overLimit:
+            self._chargeHint.setStyleSheet(f"color:{COL_DANGER};font-size:17px;")
+            self._chargeHint.setText(LIMIT_MESSAGE)
+        elif self._chargeHint.text() == LIMIT_MESSAGE:
+            # 금액을 줄여서 한도 안으로 들어왔으면 안내를 걷어낸다
+            self._chargeHint.setText("")
+        # ★ 충전 응답을 기다리는 동안엔 금액을 만져도 버튼이 다시 켜지면 안 된다.
+        #   (같은 카드에 두 번 써질 수 있다)
+        self._chargeBtn.setEnabled(amount > 0 and not overLimit
+                                   and not self._chargePending
+                                   and self._net.isConnected())
+
+    def _submitCharge(self):
+        amount = self._chargeAmount()
+        if amount <= 0:
+            return
+        self._chargePending = True
+        self._chargeBtn.setEnabled(False)
+        self._chargeHomeBtn.setEnabled(True)   # 충전 중에도 나갈 수는 있게 둔다
+        self._chargeBtn.setText("충전 처리 중…")
+        self._chargeHint.setStyleSheet(f"color:{COL_SUBTLE};font-size:17px;")
+        self._chargeHint.setText("카드를 리더기에 올려주세요…")
+        self._net.send({"cmd": "chargeCard", "cardId": self._cardId,
+                        "cardUid": self._cardUid, "amount": amount})
+
+    def _chargeFailed(self, message: str):
+        self._chargePending = False
+        self._chargeBtn.setText("충전하기")
+        self._refreshChargeTotal()
+        # 한도 안내를 덮어써야 하니 _refreshChargeTotal 뒤에 쓴다
+        self._chargeHint.setStyleSheet(f"color:{COL_DANGER};font-size:17px;")
+        self._chargeHint.setText(message)
+
+    # ── 화면 3: 상품 선택 ────────────────────────────────────────
     def _pageSelect(self) -> QWidget:
         page = QWidget()
         lay = QVBoxLayout(page)
@@ -292,6 +602,8 @@ class CustomerKiosk(QMainWindow):
         self._cartLabel.setStyleSheet(f"color:{COL_SUBTLE};font-size:18px;")
         self._totalLabel = QLabel("0원")
         self._totalLabel.setStyleSheet(f"color:{COL_TEXT};font-size:30px;font-weight:800;")
+        selectHome = bigButton("처음으로", primary=False)
+        selectHome.clicked.connect(self._goHome)
         self._orderBtn = bigButton("주문하기")
         self._orderBtn.setEnabled(False)
         self._orderBtn.clicked.connect(self._goPay)
@@ -299,6 +611,7 @@ class CustomerKiosk(QMainWindow):
         foot.addStretch(1)
         foot.addWidget(self._totalLabel)
         foot.addSpacing(20)
+        foot.addWidget(selectHome)
         foot.addWidget(self._orderBtn)
         lay.addLayout(foot)
         return page
@@ -351,7 +664,7 @@ class CustomerKiosk(QMainWindow):
         self._totalLabel.setText(f"{total:,}원")
         self._orderBtn.setEnabled(bool(items) and self._net.isConnected())
 
-    # ── 화면 2: 결제 ─────────────────────────────────────────────
+    # ── 화면 4: 결제 ─────────────────────────────────────────────
     def _pagePay(self) -> QWidget:
         page = QWidget()
         lay = QVBoxLayout(page)
@@ -409,7 +722,7 @@ class CustomerKiosk(QMainWindow):
         self._payHint.setText("")
         self._payBtn.setEnabled(True)
         self._cancelBtn.setEnabled(True)
-        self._showPage(2, "결제")
+        self._showPage(PAGE_PAY, "결제")
 
     def _submitOrder(self):
         """createOrder → (성공하면) requestPayment 로 이어진다."""
@@ -429,7 +742,7 @@ class CustomerKiosk(QMainWindow):
         self._payBtn.setEnabled(True)
         self._cancelBtn.setEnabled(True)
 
-    # ── 화면 3: 진행/완료 ────────────────────────────────────────
+    # ── 화면 5: 진행/완료 ────────────────────────────────────────
     def _pageProgress(self) -> QWidget:
         page = QWidget()
         lay = QVBoxLayout(page)
@@ -452,6 +765,18 @@ class CustomerKiosk(QMainWindow):
         self._progressSub.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._progressSub.setStyleSheet(f"color:{COL_SUBTLE};font-size:20px;")
         lay.addWidget(self._progressSub)
+
+        lay.addSpacing(24)
+        # 자동 복귀를 기다리기 싫은 손님(=뒤에 줄 선 손님)이 바로 넘길 수 있게.
+        # 화면을 놓아줘도 되는 상태일 때만 보인다.
+        self._progressHomeBtn = bigButton("처음으로", primary=False)
+        self._progressHomeBtn.clicked.connect(self._goHome)
+        self._progressHomeBtn.hide()
+        btnRow = QHBoxLayout()
+        btnRow.addStretch(1)
+        btnRow.addWidget(self._progressHomeBtn)
+        btnRow.addStretch(1)
+        lay.addLayout(btnRow)
         lay.addStretch(1)
         return page
 
@@ -460,6 +785,29 @@ class CustomerKiosk(QMainWindow):
         self._progressMain.setText(main)
         self._progressMain.setStyleSheet(f"color:{color};font-size:40px;font-weight:800;")
         self._progressSub.setText(sub)
+
+    # ── 진행 화면 자동 복귀 ──────────────────────────────────────
+    def _scheduleHome(self, delayMs: int, sub: str):
+        """delayMs 뒤에 홈으로 돌아간다. 남은 시간을 아래줄에 같이 보여준다."""
+        self._homeSub = sub
+        self._homeLeft = delayMs // 1000
+        self._homeTimer.start(delayMs)
+        self._countdownTimer.start()
+        self._progressHomeBtn.show()
+        self._paintCountdown()
+
+    def _cancelHome(self):
+        self._homeTimer.stop()
+        self._countdownTimer.stop()
+        self._progressHomeBtn.hide()
+
+    def _tickCountdown(self):
+        self._homeLeft = max(0, self._homeLeft - 1)
+        self._paintCountdown()
+
+    def _paintCountdown(self):
+        tail = f"{self._homeLeft}초 후 처음 화면으로 돌아갑니다"
+        self._progressSub.setText(f"{self._homeSub} · {tail}" if self._homeSub else tail)
 
     # ── 화면 전환 ────────────────────────────────────────────────
     def _showPage(self, index: int, title: str):
@@ -473,11 +821,17 @@ class CustomerKiosk(QMainWindow):
             card.reset()
         self._payBtn.setText("카드 결제")
         self._refreshCart()
-        self._showPage(1, "상품을 골라주세요")
+        self._showPage(PAGE_SELECT, "상품을 골라주세요")
         self._requestProducts()
 
-    def _goCardTag(self):
-        """주문 완료(픽업까지 끝) 후 처음으로 — 다음 손님을 위해 카드도 새로 태그."""
+    def _goHome(self):
+        """볼일이 끝났다(또는 손님이 그만뒀다) — 다음 손님을 위해 전부 비운다.
+
+        ★ 아직 함에 안 찾아간 물건이 있어도 여기로 온다. 내 주문 추적을 놓는
+          것뿐이고, 남은 픽업은 서버와 픽업 보드가 알아서 끝낸다.
+        """
+        self._cancelHome()
+        self._flow = None
         self._cardId = None
         self._cardUid = None
         self._memberName = None
@@ -485,11 +839,15 @@ class CustomerKiosk(QMainWindow):
         for card in self._cards.values():
             card.reset()
         self._payBtn.setText("카드 결제")
+        self._chargePending = False
+        self._chargeBtn.setText("충전하기")
+        self._chargeHint.setText("")
+        self._amountEdit.setText("")
         self._refreshCart()
         self._setBalance(None)
         self._tagBtn.setEnabled(True)
         self._tagHint.setText("")
-        self._showPage(0, "카드를 태그해주세요")
+        self._showPage(PAGE_HOME, "무엇을 도와드릴까요?")
 
     # ── 하단 상태 ────────────────────────────────────────────────
     def _statusBar(self) -> QWidget:
@@ -519,18 +877,26 @@ class CustomerKiosk(QMainWindow):
     def _requestProducts(self):
         self._net.send({"cmd": "getProducts"})
 
+    def _pollProducts(self):
+        """재고는 상품 화면을 보고 있을 때만 다시 물어본다(충전 중엔 의미 없음)."""
+        if self._stack.currentIndex() == PAGE_SELECT:
+            self._requestProducts()
+
     def _onConnected(self):
         self._setServerStatus(True)
         self._requestProducts()
         self._refreshCart()
+        self._refreshChargeTotal()
 
     def _onDisconnected(self):
         self._setServerStatus(False)
         self._orderBtn.setEnabled(False)
+        self._chargeBtn.setEnabled(False)
 
     def _onMessage(self, msg: dict):
         handler = {
             "cardTagResult": self._hCardTagResult,
+            "chargeResult":  self._hChargeResult,
             "productList":   self._hProductList,
             "orderCreated":  self._hOrderCreated,
             "paymentResult": self._hPaymentResult,
@@ -559,8 +925,36 @@ class CustomerKiosk(QMainWindow):
         self._memberName = msg.get("memberName")
         self._setBalance(msg.get("balance"))
         self._tagHint.setText("")
-        self._showPage(1, "상품을 골라주세요")
+        if self._flow == FLOW_CHARGE:
+            self._enterCharge()
+            return
+        self._showPage(PAGE_SELECT, "상품을 골라주세요")
         self._requestProducts()
+
+    def _hChargeResult(self, msg: dict):
+        if not msg.get("success"):
+            reason = msg.get("reason", "")
+            text = {
+                "noCard": "카드를 인식하지 못했습니다. 다시 태그해주세요",
+                "cardMismatch": "처음 태그한 카드와 다릅니다. 같은 카드로 충전해주세요",
+                "cardTimeout": "카드 태그 시간이 초과되었습니다. 다시 시도해주세요",
+                "readerBusy": "잠시 후 다시 시도해주세요",
+                "cardReadError": "카드를 읽지 못했습니다. 다시 시도해주세요",
+                "cardWriteError": "충전에 실패했습니다. 다시 시도해주세요",
+                "invalidAmount": "충전 금액을 확인해주세요",
+                "balanceLimit": f"카드 최대 잔액은 {MAX_CARD_BALANCE:,}원입니다",
+            }.get(reason, f"충전 실패 ({reason})")
+            self._chargeFailed(text)
+            return
+        charged = msg.get("amount", 0)
+        self._chargePending = False
+        self._setBalance(msg.get("balance"))
+        self._amountEdit.setText("")
+        self._chargeBtn.setText("충전하기")
+        self._refreshChargeTotal()
+        self._chargeHint.setStyleSheet(f"color:{COL_OK};font-size:17px;")
+        self._chargeHint.setText(
+            f"{charged:,}원 충전 완료 · 잔액 {msg.get('balance', 0):,}원")
 
     def _hProductList(self, msg: dict):
         self._products = msg.get("items", [])
@@ -593,9 +987,10 @@ class CustomerKiosk(QMainWindow):
             return
         if "balance" in msg:
             self._setBalance(msg["balance"])
+        self._cancelHome()
         self._setProgress("🧾", "결제가 완료되었습니다",
                           f"주문번호 {self._orderId} · 상품을 준비합니다")
-        self._showPage(3, "주문 진행")
+        self._showPage(PAGE_PROGRESS, "주문 진행")
 
     def _hDispatchStatus(self, msg: dict):
         # ★ broadcast 라 다른 손님 주문도 온다. 내 것만 본다.
@@ -605,22 +1000,32 @@ class CustomerKiosk(QMainWindow):
         if state == OrderStatus.DISPATCHING:
             self._setProgress("📦", "상품을 준비하고 있습니다", "잠시만 기다려주세요")
         elif state == OrderStatus.DONE:
-            self._setProgress("🙇", "이용해 주셔서 감사합니다", "곧 처음 화면으로 돌아갑니다")
-            QTimer.singleShot(DONE_RESET_MS, self._goCardTag)
+            # 손님이 그 자리에서 바로 꺼낸 경우에만 여기까지 온다.
+            # (보통은 pickupReady 의 자동 복귀가 먼저 걸려서 이미 홈이다)
+            self._setProgress("🙇", "이용해 주셔서 감사합니다", "")
+            self._scheduleHome(DONE_RESET_MS, "")
         elif state == OrderStatus.ERROR:
+            # 실패 화면을 계속 띄워두면 키오스크가 통째로 멈춘다 — 오래 보여주되
+            # 결국은 놓아준다. 물건/환불은 직원이 처리한다.
             self._setProgress("⚠️", "출고 중 문제가 발생했습니다",
                               "직원을 호출해 주세요", COL_DANGER)
+            self._scheduleHome(ERROR_RESET_MS, "직원을 호출해 주세요")
 
     def _hPickupReady(self, msg: dict):
+        # ★ 출고가 끝나 물건이 함에 놓였다. 여기서 화면을 놓아준다 —
+        #   손님이 실제로 꺼낼 때까지 붙잡고 있으면 픽업박스가 3개여도
+        #   다음 손님이 주문을 시작할 수 없다.
         if msg.get("orderId") != self._orderId:
             return
         self._setProgress("✅", f"{msg.get('slot')}번 함에서 찾아가세요",
-                          "물건을 꺼내시면 주문이 완료됩니다", COL_OK)
+                          "", COL_OK)
+        self._scheduleHome(PICKUP_RESET_MS, "물건을 꺼내주세요")
 
     def _hAlert(self, msg: dict):
         # ★ broadcast 라 다른 손님 주문 알림도 온다. 내 것만 본다.
         if msg.get("orderId") != self._orderId:
             return
+        self._cancelHome()
         self._setProgress("⏳", msg.get("message") or "잠시만 기다려주세요",
                           "곧 이어서 진행됩니다", COL_WARN)
 
