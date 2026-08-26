@@ -53,6 +53,9 @@ SLOT_COUNT = 3
 # 보드가 통째로 뻗어도 주문이 갇히지 않게 하는 안전망.
 ORDER_TIMEOUT = 60.0    # 출고 지시 후 아무 보고도 없으면 실패로 정리한다
 
+# RFID 카드 태그를 이 시간 안에 안 하면 결제 시도를 포기한다.
+PAYMENT_TIMEOUT = 15.0
+
 
 class Order:
     """주문 한 건. MainService 가 메모리에 소유하는 내부 객체다.
@@ -61,14 +64,15 @@ class Order:
     (DB 는 표기·복구용 사본)
     """
 
-    def __init__(self, orderId: int, memberId: int, items: list,
+    def __init__(self, orderId: int, items: list,
                  status: str = OrderStatus.PENDING, assignedSlot: int | None = None,
-                 db=None):
+                 totalPrice: int = 0, cardUid: str | None = None, db=None):
         self.orderId = orderId
-        self.memberId = memberId
         self.items = items
         self.status = status
         self.assignedSlot = assignedSlot
+        self.totalPrice = totalPrice   # RFID 잔액 결제 시 카드 잔액과 비교하는 데 씀
+        self.cardUid = cardUid         # 결제 태그 전엔 None. member 를 대신함
         self._db = db  # 상태 변경 시 위임 저장할 DBManager 참조
 
     # ── 상태 변경 → 곧바로 DB에 위임 저장 ────────────────────────
@@ -88,25 +92,28 @@ class Order:
         if self._db:
             self._db.releaseSlot(slot)
 
+
     # ── DB row → Order 객체 복구용 ───────────────────────────────
     @classmethod
     def fromDbRow(cls, row: dict, db=None):
         return cls(
             orderId=row["id"],
-            memberId=row["memberId"],
             items=row.get("items", []),
             status=row.get("status", OrderStatus.PENDING),
             assignedSlot=row.get("assignedSlot"),
+            totalPrice=row.get("totalPrice", 0),
+            cardUid=row.get("cardUid"),
             db=db,
         )
 
     def toDict(self) -> dict:
         return {
             "id": self.orderId,
-            "memberId": self.memberId,
+            "cardUid": self.cardUid,
             "items": self.items,
             "status": self.status,
             "assignedSlot": self.assignedSlot,
+            "totalPrice": self.totalPrice,
         }
 
 
@@ -128,6 +135,15 @@ class MainService:
         # 픽업박스 상태. 픽업 보드(Serial)의 slotState 이벤트로 갱신된다.
         # slot -> orderId(사용중) / None(빔). 센서값이 실물 정본이다.
         self.slotOccupied: dict[int, int | None] = {n: None for n in range(1, SLOT_COUNT + 1)}
+
+        # RFID 카드 리더기가 하나뿐이라 아래 둘 중 하나만 동시에 진행된다.
+        # 상품 고르기 전 "카드 태그" — 주문 생성에 쓸 cardUid 를 읽어온다.
+        # {"clientId", "since"}
+        self._pendingCardTag: dict | None = None
+        # 결제 확인 — GS 로 같은 카드인지 대조한 뒤 GT→ST 로 잔액 차감.
+        # {"orderId", "clientId", "step": "GS"/"GT"/"ST", "since", ["newBalance"]}
+        self._pendingPayment: dict | None = None
+
         self.network = NetworkManager(
             self.inQueue,
             tcpPort=9000,
@@ -201,25 +217,24 @@ class MainService:
         if cmd == "getProducts":
             resp = {"cmd": "productList", "items": self.db.getProducts()}
 
-        elif cmd == "signup":
-            ok, memberId = self.db.createMember(
-                msg["username"], msg["password"], msg["name"], msg["contact"])
-            resp = ({"cmd": "signupResult", "success": True, "memberId": memberId}
-                    if ok else
-                    {"cmd": "signupResult", "success": False,
-                     "reason": "duplicateUsername"})
-
-        elif cmd == "login":
-            member = self.db.login(msg["username"], msg["password"])
-            resp = ({"cmd": "loginResult", "success": True, "member": member}
-                    if member else {"cmd": "loginResult", "success": False})
+        elif cmd == "tagCard":
+            # 상품 고르기 전, 주문에 붙일 cardUid 를 알아내려고 카드를 태그한다.
+            # 화면에 잔액도 보여줄 거라 GS 로 UID 읽고 바로 GT 로 잔액도 같이 읽는다.
+            if self._readerBusy():
+                resp = {"cmd": "cardTagResult", "success": False, "reason": "readerBusy"}
+            else:
+                self._pendingCardTag = {"clientId": clientId, "step": "GS",
+                                         "since": time.monotonic()}
+                self.network.sendBoard({"cmd": "getCardStatus"})
+                print("[CC] 카드 태그 대기 (주문 시작)")
 
         elif cmd == "createOrder":
-            ok, orderId, total = self.db.createOrder(msg["memberId"], msg["items"])
+            cardUid = msg["cardUid"]
+            ok, orderId, total = self.db.createOrder(cardUid, msg["items"])
             if ok:
                 self.orders[orderId] = Order(
-                    orderId, msg["memberId"], msg["items"],
-                    status=OrderStatus.PENDING, db=self.db)
+                    orderId, msg["items"], cardUid=cardUid,
+                    status=OrderStatus.PENDING, totalPrice=total, db=self.db)
                 resp = {"cmd": "orderCreated", "success": True,
                         "orderId": orderId, "totalPrice": total}
             else:
@@ -229,26 +244,29 @@ class MainService:
         elif cmd == "requestPayment":
             orderId = msg["orderId"]
             order = self.orders.get(orderId)
-            if order:  # TODO: 실제 결제 처리
-                self.db.confirmPayment(orderId)
-                order.status = OrderStatus.PAID  # confirmPayment 가 이미 DB 에 반영함 — 다시 쓸 필요 없음
-                resp = {"cmd": "paymentResult", "orderId": orderId,
-                        "status": "success"}
-                # 보드가 비어 있으면 바로 보내고, 처리 중이면 대기열에 세운다
-                self._queueDispatch(orderId)
-            else:
+            if order is None:
                 resp = {"cmd": "paymentResult", "orderId": orderId,
                         "status": "fail", "reason": "unknownOrder"}
+            elif self._readerBusy():
+                # 카드 리더기가 하나뿐이라 동시에 두 건을 처리 못 한다.
+                resp = {"cmd": "paymentResult", "orderId": orderId,
+                        "status": "fail", "reason": "readerBusy"}
+            else:
+                # 실제 결제 처리는 비동기(RFID 카드 태그 대기)라 여기서 바로
+                # resp 를 안 만든다 — _onRfidResponse 가 끝나고 나서 보낸다.
+                self._pendingPayment = {
+                    "orderId": orderId, "clientId": clientId,
+                    "step": "GS", "since": time.monotonic(),
+                }
+                self.network.sendBoard({"cmd": "getCardStatus"})
+                print(f"[CC] 주문 {orderId} 결제 확인 — 카드 재태그 대기")
 
         elif cmd == "getHistory":
             resp = {"cmd": "historyData",
-                    "orders": self.db.getOrdersByMember(msg["memberId"])}
+                    "orders": self.db.getOrdersByCard(msg["cardUid"])}
 
         elif cmd == "getAllOrders":
             resp = {"cmd": "allOrdersData", "orders": self.db.getAllOrders()}
-
-        elif cmd == "getMembers":
-            resp = {"cmd": "memberList", "members": self.db.getMembers()}
 
         elif cmd == "watchCam":
             # Admin GUI 가 "이 카메라를 내 UDP 포트로 보내달라" 고 신청한다.
@@ -316,11 +334,124 @@ class MainService:
             self._onBoardLost(boardName, event)
         elif event == "slotState":
             self._onSlotState(msg.get("slot"), msg.get("occupied"))
+        elif event == "rfidResponse":
+            self._onRfidResponse(msg)
         elif "hello" in msg:
             # 보드가 방금 부팅했다. 곧 자기 상태를 전부 보고해 온다.
             print(f"[CC] 보드 인사: {msg.get('hello')}")
         else:
             print(f"[CC] 미처리 보드 이벤트 ({boardName}): {msg}")
+
+    def _readerBusy(self) -> bool:
+        """카드 리더기가 하나뿐이라 카드 태그/결제 확인을 동시에 못 한다."""
+        return self._pendingCardTag is not None or self._pendingPayment is not None
+
+    # ── RFID 응답 라우팅: 카드 태그(주문 시작) vs 결제 확인 중 진행 중인 쪽으로 ──
+    def _onRfidResponse(self, msg: dict):
+        if self._pendingCardTag is not None:
+            self._onCardTagResponse(msg)
+        elif self._pendingPayment is not None:
+            self._onPaymentRfidResponse(msg)
+        # 둘 다 없으면 늦게 온 응답 등 — 무시
+
+    # ── 카드 태그 (tagCard — 상품 고르기 전, cardUid + 잔액을 읽어온다) ──
+    def _onCardTagResponse(self, msg: dict):
+        pending = self._pendingCardTag
+        if msg.get("cmd") != pending["step"]:
+            return
+
+        if pending["step"] == "GS":
+            if not msg.get("ok"):
+                self._pendingCardTag = None
+                self.network.sendTo(pending["clientId"], {
+                    "cmd": "cardTagResult", "success": False, "reason": "noCard"})
+                return
+            pending["uid"] = msg["uid"]
+            pending["step"] = "GT"
+            self.network.sendBoard({"cmd": "getCardBalance", "uid": pending["uid"]})
+
+        elif pending["step"] == "GT":
+            self._pendingCardTag = None
+            # 잔액 조회는 실패해도 UID 는 이미 확보했으니 태그 자체는 성공으로 친다.
+            # 화면엔 잔액이 그냥 안 뜨거나 "-" 로 나온다.
+            balance = msg["total"] if msg.get("ok") else None
+            print(f"[CC] 카드 태그 완료: {pending['uid']} (잔액: {balance})")
+            self.network.sendTo(pending["clientId"], {
+                "cmd": "cardTagResult", "success": True,
+                "cardUid": pending["uid"], "balance": balance})
+
+    # ── 결제 확인 (requestPayment 가 시작해서 GS→GT→ST 순으로 진행) ──
+    def _onPaymentRfidResponse(self, msg: dict):
+        pending = self._pendingPayment
+        if msg.get("cmd") != pending["step"]:
+            return  # 우리가 기다리던 응답이 아니다(늦게 온 응답 등) — 무시
+
+        order = self.orders.get(pending["orderId"])
+        if order is None:
+            self._pendingPayment = None
+            return
+
+        if pending["step"] == "GS":
+            if not msg.get("ok"):
+                self._failPayment("noCard")
+                return
+            if msg["uid"] != order.cardUid:
+                # 주문 만들 때 태그한 카드랑 다르다 — 남의 카드로 결제 못 하게 막는다.
+                print(f"[CC] 주문 {order.orderId} 카드 불일치 "
+                      f"(주문 카드 {order.cardUid} / 태그된 카드 {msg['uid']})")
+                self._failPayment("cardMismatch")
+                return
+            pending["step"] = "GT"
+            self.network.sendBoard({"cmd": "getCardBalance", "uid": order.cardUid})
+
+        elif pending["step"] == "GT":
+            if not msg.get("ok"):
+                self._failPayment("cardReadError")
+                return
+            balance = msg["total"]
+            if balance < order.totalPrice:
+                print(f"[CC] 주문 {order.orderId} 잔액부족 (카드 {balance} / "
+                      f"주문 {order.totalPrice}) — 주문 취소")
+                self.db.cancelOrder(order.orderId)
+                self.orders.pop(order.orderId, None)
+                self._failPayment("insufficientBalance")
+                return
+            pending["newBalance"] = balance - order.totalPrice
+            pending["step"] = "ST"
+            self.network.sendBoard({"cmd": "setCardBalance", "uid": order.cardUid,
+                                     "total": pending["newBalance"]})
+
+        elif pending["step"] == "ST":
+            if not msg.get("ok"):
+                # 카드에서 실제로는 안 깎였으니 주문은 살려두고 재시도할 수 있게 한다.
+                self._failPayment("cardWriteError")
+                return
+            self._completePayment()
+
+    def _completePayment(self):
+        pending = self._pendingPayment
+        self._pendingPayment = None
+        order = self.orders.get(pending["orderId"])
+        if order is None:
+            return
+        self.db.confirmPayment(order.orderId)
+        order.status = OrderStatus.PAID  # confirmPayment 가 이미 DB 에 반영함
+        print(f"[CC] 주문 {order.orderId} RFID 결제 완료 (카드 남은 잔액 {pending['newBalance']})")
+        self.network.sendTo(pending["clientId"], {
+            "cmd": "paymentResult", "orderId": order.orderId, "status": "success",
+            "balance": pending["newBalance"]})
+        # 보드가 비어 있으면 바로 보내고, 처리 중이면 대기열에 세운다
+        self._queueDispatch(order.orderId)
+
+    def _failPayment(self, reason: str):
+        pending = self._pendingPayment
+        self._pendingPayment = None
+        if pending is None:
+            return
+        print(f"[CC] 주문 {pending['orderId']} 결제 실패: {reason}")
+        self.network.sendTo(pending["clientId"], {
+            "cmd": "paymentResult", "orderId": pending["orderId"],
+            "status": "fail", "reason": reason})
 
     # ── 출고 시퀀스 ──────────────────────────────────────────────
     # 서버는 '무엇을 몇 개, 어느 슬롯에' 만 정해서 분배 보드에 한 번 보낸다.
@@ -332,6 +463,12 @@ class MainService:
 
     def _pumpDispatch(self):
         """보드가 놀고 있고 빈 슬롯이 있으면 대기열에서 하나 꺼내 보낸다."""
+        if not self.boardReady and self.waitingOrders:
+            # ★ 여기서 조용히 멈추면 슬롯을 비워도 다음 주문이 영영 안 나간다.
+            #   activeOrderId 의 orderComplete/orderFailed 보고가 안 왔다는 뜻이라,
+            #   ORDER_TIMEOUT(60초) 안전망이 걸릴 때까지 대기 상태가 이어진다.
+            print(f"[CC] boardReady=False — 주문 {list(self.waitingOrders)} 대기 중 "
+                  f"(진행중 주문: {self.activeOrderId})")
         while self.boardReady and self.waitingOrders:
             orderId = self.waitingOrders[0]
             order = self.orders.get(orderId)
@@ -343,6 +480,9 @@ class MainService:
             if slot is None:
                 # 픽업박스가 다 찼다. 손님이 찾아가면(slotReleased) 다시 시도한다.
                 print(f"[CC] 빈 픽업박스 없음 — 주문 {orderId} 대기")
+                self.network.broadcastTcp({
+                    "cmd": "alert", "level": "warn", "orderId": orderId,
+                    "message": "픽업 슬롯이 꽉 찼습니다. 잠시 후 다시 시도합니다"})
                 return
 
             counts = self._buildCounts(order)
@@ -441,6 +581,21 @@ class MainService:
             self._failActiveOrder(FailReason.BOARD_TIMEOUT)
             self.boardReady = True
             self._pumpDispatch()
+
+        # 카드를 안 태그하거나 리더기가 응답이 없다 → 결제 시도를 포기한다.
+        if (self._pendingPayment is not None
+                and now - self._pendingPayment["since"] > PAYMENT_TIMEOUT):
+            print(f"[CC] 결제 {PAYMENT_TIMEOUT:.0f}초 무응답 — 결제 정리")
+            self._failPayment("cardTimeout")
+
+        # 주문 시작용 카드 태그도 마찬가지로 무한 대기하지 않게 한다.
+        if (self._pendingCardTag is not None
+                and now - self._pendingCardTag["since"] > PAYMENT_TIMEOUT):
+            print(f"[CC] 카드 태그 {PAYMENT_TIMEOUT:.0f}초 무응답 — 정리")
+            pending = self._pendingCardTag
+            self._pendingCardTag = None
+            self.network.sendTo(pending["clientId"], {
+                "cmd": "cardTagResult", "success": False, "reason": "cardTimeout"})
 
     def _onBoardLost(self, boardName: str, event: str):
         """보드 접속/재접속.
