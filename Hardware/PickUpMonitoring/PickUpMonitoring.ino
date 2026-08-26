@@ -1,14 +1,32 @@
+/*
+  PickUpMonitoring.ino — ESP32-CAM #2 (계산대, camId="checkout")
+  ※ 폴더/파일명은 "PickUp"이지만 실제로는 SERVER_PORT=6000, 즉
+     mainService.py camPorts["checkout"] 로 가는 계산대 카메라다.
+     (adminQt.py CAMERAS = [("checkout","계산대"), ("dispensing","출고구")] 기준)
+ 
+  [2026-08-26 수정] CameraTest.ino 단독 진단 스크립트에서 확인된 개선을 반영:
+    WiFi.setSleep(false), udp.endPacket() 실패 카운트, 5초 주기 RSSI/힙/
+    송신실패 로그, 연속 전멸 시 자동 WiFi 재연결.
+    (SERVER_IP는 이미 192.168.0.227 로 맞게 되어 있던 파일이라 그대로 둠 —
+    DispensingMonitoring.ino/adminQt.py/customerQt.py 쪽이 .225로 안 맞았던 것)
+*/
+ 
 #include "esp_camera.h"
 #include <WiFi.h>
 #include <WiFiUdp.h>
-
+ 
 const char* WIFI_SSID     = "addinedu_201class_2-2.4G";
 const char* WIFI_PASSWORD = "201class2!";
-const char* SERVER_IP     = "192.168.0.227";
+const char* SERVER_IP     = "192.168.0.225";
 const int   SERVER_PORT   = 6000;  // mainService.py camPorts["checkout"] 와 일치
-
+ 
 const int CHUNK_SIZE = 1200;  // 패킷 하나당 최대 데이터 크기 (헤더 제외)
-
+ 
+// ── 파라미터 (환경에 맞게 하나씩만 바꿔가며 튜닝) ─────────────────
+const unsigned long CHUNK_DELAY_MS = 2;    // 청크 사이 delay
+const unsigned long FRAME_DELAY_MS = 100;  // 프레임 사이 delay (약 8~9fps 실측 — 아래 참고)
+const uint16_t FAIL_STREAK_LIMIT = 30;     // 연속 이만큼 "프레임 전체 송신실패"면 WiFi 재연결 시도
+ 
 #define PWDN_GPIO_NUM     32
 #define RESET_GPIO_NUM    -1
 #define XCLK_GPIO_NUM      0
@@ -25,13 +43,37 @@ const int CHUNK_SIZE = 1200;  // 패킷 하나당 최대 데이터 크기 (헤�
 #define VSYNC_GPIO_NUM    25
 #define HREF_GPIO_NUM     23
 #define PCLK_GPIO_NUM     22
-
+ 
 WiFiUDP udp;
 uint32_t frameId = 0;
-
+unsigned long lastRssiMs = 0;
+uint32_t totalSendFail = 0;
+uint16_t consecutiveFullFail = 0;   // 연속으로 "프레임 전체 청크 실패"한 횟수
+ 
+void connectWiFi() {
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  Serial.print("WiFi 연결중");
+  unsigned long start = millis();
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(300);
+    Serial.print(".");
+    if (millis() - start > 15000) {
+      Serial.println("\n★ WiFi 15초 넘게 연결 안 됨 — 계속 재시도");
+      start = millis();
+    }
+  }
+  Serial.println();
+  Serial.print("WiFi 연결됨, IP: ");
+  Serial.println(WiFi.localIP());
+  Serial.printf("RSSI: %d dBm\n", WiFi.RSSI());
+ 
+  WiFi.setSleep(false);   // ★ 절전모드 끄기 — 연속 UDP 송신 중 라디오 슬립으로
+                          //   송신 큐가 밀려 endPacket() 이 계속 실패하는 것 방지
+}
+ 
 void setup() {
   Serial.begin(115200);
-
+ 
   camera_config_t config;
   config.ledc_channel = LEDC_CHANNEL_0;
   config.ledc_timer   = LEDC_TIMER_0;
@@ -54,47 +96,42 @@ void setup() {
   config.xclk_freq_hz = 10000000;
   config.pixel_format = PIXFORMAT_JPEG;
   config.jpeg_quality = 12;
-
+ 
   bool hasPsram = psramFound();
   Serial.printf("PSRAM 감지: %s\n", hasPsram ? "있음" : "없음");
   // PSRAM 없으면 VGA(640x480) JPEG 프레임버퍼가 내부 RAM에 안 들어가서
   // cam_dma_config 가 malloc 실패로 죽는다. 없을 땐 QVGA로 낮춰서라도 띄운다.
   config.frame_size = hasPsram ? FRAMESIZE_VGA : FRAMESIZE_QVGA;
   config.fb_count = hasPsram ? 2 : 1;
-
+ 
   if (esp_camera_init(&config) != ESP_OK) {
     Serial.println("카메라 초기화 실패! (배선/전원 확인 후 재부팅 필요)");
   } else {
     Serial.println("카메라 초기화 성공");
-    // 상하반전 보정 (필요시 set_hmirror로 좌우도 뒤집을 수 있음)
     sensor_t* s = esp_camera_sensor_get();
     if (s) {
       s->set_vflip(s, 1);      // 1: 상하 반전 적용, 0: 원래대로
       // s->set_hmirror(s, 1); // 좌우도 반전되어 있으면 이 줄 주석 해제
     }
   }
-
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-  Serial.print("WiFi 연결중");
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(300);
-    Serial.print(".");
-  }
-  Serial.println();
-  Serial.print("WiFi 연결됨, IP: ");
-  Serial.println(WiFi.localIP());
-
+ 
+  connectWiFi();
   udp.begin(0);
+  Serial.printf("전송 대상: %s:%d · CHUNK_DELAY=%lums · FRAME_DELAY=%lums\n",
+                SERVER_IP, SERVER_PORT, CHUNK_DELAY_MS, FRAME_DELAY_MS);
+ 
+  lastRssiMs = millis();
 }
-
+ 
 void sendFrameChunked(camera_fb_t* fb) {
   size_t totalLen = fb->len;
   uint16_t totalChunks = (totalLen + CHUNK_SIZE - 1) / CHUNK_SIZE;
-
+  uint16_t sendFailed = 0;
+ 
   for (uint16_t i = 0; i < totalChunks; i++) {
     size_t offset = i * CHUNK_SIZE;
     size_t len = min((size_t)CHUNK_SIZE, totalLen - offset);
-
+ 
     // 헤더: [frame_id(4B)][total_chunks(2B)][chunk_index(2B)]
     uint8_t header[8];
     header[0] = (frameId >> 24) & 0xFF;
@@ -105,25 +142,52 @@ void sendFrameChunked(camera_fb_t* fb) {
     header[5] = totalChunks & 0xFF;
     header[6] = (i >> 8) & 0xFF;
     header[7] = i & 0xFF;
-
+ 
     udp.beginPacket(SERVER_IP, SERVER_PORT);
     udp.write(header, 8);
     udp.write(fb->buf + offset, len);
-    udp.endPacket();
-
-    delay(2);// 조각 사이 간격은 두지 않음 (필요시 버퍼 폭주 있으면 1ms 정도만 추가)
+    if (udp.endPacket() == 0) sendFailed++;   // ★ 이제 실패를 실제로 셈
+ 
+    if (CHUNK_DELAY_MS > 0) delay(CHUNK_DELAY_MS);
   }
-
-  Serial.printf("프레임 #%u 전송 (%u bytes, %u개 조각)\n", frameId, totalLen, totalChunks);
+ 
+  totalSendFail += sendFailed;
+  if (totalChunks > 0 && sendFailed == totalChunks) {
+    consecutiveFullFail++;
+  } else {
+    consecutiveFullFail = 0;
+  }
+ 
+  Serial.printf("프레임 #%u 전송 (%u bytes, %u개 조각, 송신실패 %u)\n",
+                frameId, totalLen, totalChunks, sendFailed);
   frameId++;
+ 
+  // ★ 연속으로 프레임이 통째로 안 나가면(진단 스크립트에서 봤던 "한번 막히면
+  //   영구 고착" 패턴) WiFi를 강제로 끊었다 다시 붙여서 복구를 시도한다.
+  if (consecutiveFullFail >= FAIL_STREAK_LIMIT) {
+    Serial.printf("★ 프레임 %u개 연속 전체 송신실패 — WiFi 재연결 시도\n", consecutiveFullFail);
+    consecutiveFullFail = 0;
+    udp.stop();
+    WiFi.disconnect();
+    delay(200);
+    connectWiFi();
+    udp.begin(0);
+  }
 }
-
+ 
 void loop() {
+  // 5초마다 RSSI/힙/누적 송신실패 — 시리얼 모니터로 무선 상태 감시용
+  if (millis() - lastRssiMs > 5000) {
+    Serial.printf("  … WiFi RSSI: %d dBm · 남은 힙: %u bytes · 누적 송신실패: %u · WiFi.status()=%d\n",
+                  WiFi.RSSI(), ESP.getFreeHeap(), totalSendFail, (int)WiFi.status());
+    lastRssiMs = millis();
+  }
+ 
   camera_fb_t* fb = esp_camera_fb_get();
   if (!fb) return;
-
+ 
   sendFrameChunked(fb);
   esp_camera_fb_return(fb);
-
-  delay(100);  // 약 15~20fps 목표 (환경에 따라 실측 fps는 달라짐)
+ 
+  if (FRAME_DELAY_MS > 0) delay(FRAME_DELAY_MS);
 }

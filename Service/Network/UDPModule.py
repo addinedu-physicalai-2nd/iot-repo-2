@@ -30,7 +30,7 @@ HEADER = struct.Struct(">IHH")        # frameId, totalChunks, chunkIndex
 HEADER_SIZE = HEADER.size             # 8
 
 FRAME_TIMEOUT = 2.0                   # 미완성 프레임 폐기 기준(초)
-MAX_PENDING = 8                       # 동시에 들고 있을 미완성 프레임 수
+MAX_PENDING = 16                       # 동시에 들고 있을 미완성 프레임 수
 RCVBUF = 1 << 20                      # 1MB — 조각이 몰려 들어올 때 커널 유실 방지
 STATS_SEC = 5.0                       # 수신 통계 출력 주기
 
