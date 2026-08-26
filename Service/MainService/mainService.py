@@ -419,8 +419,10 @@ class MainService:
             if not msg.get("ok"):
                 self._failPayment("noCard")
                 return
-            if msg["uid"] != order.cardUid:
+            if (order.cardUid or "").lower() != (msg["uid"] or "").lower():
                 # 주문 만들 때 태그한 카드랑 다르다 — 남의 카드로 결제 못 하게 막는다.
+                # (uid 는 항상 소문자 hex 로 비교 — DB/보드/클라이언트 어디서 대소문자가
+                #  섞여도 같은 카드면 같은 카드로 인식되게)
                 print(f"[CC] 주문 {order.orderId} 카드 불일치 "
                       f"(주문 카드 {order.cardUid} / 태그된 카드 {msg['uid']})")
                 self._failPayment("cardMismatch")
