@@ -59,7 +59,7 @@ RFID_STATUS_BAD_REQUEST = 0xFE
 
 class SerialHandler:
     def __init__(self, inQueue: queue.Queue, boardName: str = "board",
-                 port: str = "/dev/ttyUSB0", baud: int = 9600):
+                 port: str = "/dev/ttyUSB1", baud: int = 115200):
         self.inQueue = inQueue
         self.boardName = boardName
         self.port = port
