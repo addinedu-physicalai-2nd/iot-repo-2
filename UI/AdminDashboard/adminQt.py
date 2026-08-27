@@ -13,7 +13,8 @@ adminQt.py — SmartMart 무인매장 관리자 대시보드 (PyQt6)
   - 상품별 재고        (SR-15) getProducts   → productList
   - 픽업 슬롯 상태     (SR-11) pickupReady / slotReleased push
   - 컨베이어 상태      (SR-08) dispatchStatus 로부터 유도(출고중 주문 유무)
-  - 화재·이상 알림     (SR-30) alert push + 이상감지 상태 + 서버 연결 끊김
+  - 이상 알림          (SR-30) alert push + 출고 실패 + 서버 연결 끊김
+                              (문장으로만 쌓는다. 원본 메시지는 통신 로그 탭)
   - 서버 연결 상태     (SR-07) QtNetworkManager.connected / disconnected
   - 영상 모니터링      (SR-25) QtNetworkManager.watchCamera — UDP 로 JPEG 청크 수신
 
@@ -75,6 +76,7 @@ PAGE_CAMERAS   = 1
 PAGE_ORDERS    = 2
 PAGE_STOCK     = 3
 PAGE_MEMBERS   = 4
+PAGE_LOG       = 5
 
 SLOT_COUNT      = 3        # 픽업 슬롯 개수 (하드웨어 구성)
 STOCK_CAP       = 20       # 상품 1칸 최대 적재량 (서버가 capacity 를 주면 그 값 사용)
@@ -88,6 +90,12 @@ CAMERAS = [("checkout", "계산대"), ("dispensing", "출고구")]
 VIDEO_FPS = 12             # 서버에 요청할 프레임률
 
 MAX_LOG_ROWS = 300         # 통신 로그 보관 줄 수
+
+# 주문 관리 탭 표의 컬럼. 순서를 바꾸면 _refreshOrderList 의 values 도 같이 바꾼다.
+ORDER_COLUMNS = ["주문번호", "회원이름", "카드번호", "상태", "슬롯",
+                 "결제금액", "주문시간", "결제시간", "상품"]
+ORDER_COL_STATUS = 3       # 상태 색을 칠할 칸
+ORDER_COL_ITEMS = 8        # 남는 폭을 가져갈 칸
 LOG_DIRS = {               # commLog 의 dir -> (표시, 색)
     "toBoard":   ("→ 보드", COL_WARN),
     "fromBoard": ("← 보드", COL_OK),
@@ -171,6 +179,29 @@ def formatContact(raw) -> str:
     if len(digits) == 9 and digits.startswith("02"):        # 02-123-4567
         return f"{digits[:2]}-{digits[2:5]}-{digits[5:]}"
     return text
+
+
+def formatStamp(value, withDate: bool = True) -> str:
+    """주문/결제 시각을 표에 넣을 문자열로. 없으면 '-'.
+
+    서버가 datetime 으로 줄 때도 있고 문자열로 흘릴 때도 있어서 둘 다 받는다.
+    """
+    if value in (None, ""):
+        return "-"
+    if hasattr(value, "strftime"):
+        return value.strftime("%m-%d %H:%M:%S" if withDate else "%H:%M:%S")
+    text = str(value)
+    # "2026-08-27 14:30:05" 형태면 연도만 떼어 표 폭을 아낀다
+    if withDate and len(text) >= 19 and text[4] == "-":
+        return text[5:19]
+    return text
+
+
+def formatPrice(value) -> str:
+    try:
+        return f"{int(value):,}원"
+    except (TypeError, ValueError):
+        return "-"
 
 
 def hintLabel(text: str) -> QLabel:
@@ -301,7 +332,7 @@ class AdminDashboard(QMainWindow):
         lay.addWidget(logo)
 
         menus = ["대시보드", "주문 관리", "재고 관리", "회원 관리",
-                 "영상 모니터링", "화재·환경"]
+                 "영상 모니터링", "통신 로그"]
         self._menuBtns = []
         for i, name in enumerate(menus):
             btn = QPushButton(name)
@@ -330,13 +361,14 @@ class AdminDashboard(QMainWindow):
         "주문 관리":     PAGE_ORDERS,
         "재고 관리":     PAGE_STOCK,
         "회원 관리":     PAGE_MEMBERS,
+        "통신 로그":     PAGE_LOG,
     }
 
     def _selectMenu(self, clickedBtn):
         for b in self._menuBtns:
             b.setStyleSheet(self._menuStyle(b is clickedBtn))
         name = clickedBtn.text()
-        # 아직 화면이 없는 메뉴는 대시보드를 유지한다. TODO: 화재·환경 화면 추가
+        # 아직 화면이 없는 메뉴는 대시보드를 유지한다.
         page = self.MENU_PAGES.get(name, PAGE_DASHBOARD)
         self._showPage(page, name if page else "대시보드")
 
@@ -388,6 +420,7 @@ class AdminDashboard(QMainWindow):
         self._stack.addWidget(self._pageOrderAdmin())  # PAGE_ORDERS
         self._stack.addWidget(self._pageStockAdmin())  # PAGE_STOCK
         self._stack.addWidget(self._pageMemberAdmin()) # PAGE_MEMBERS
+        self._stack.addWidget(self._pageCommLog())     # PAGE_LOG
         lay.addWidget(self._stack, 1)
 
         # 하단 상태바
@@ -429,14 +462,23 @@ class AdminDashboard(QMainWindow):
             lay.addWidget(self._panelCamera(camId, label), 1)
         return page
 
-    # ── 화면 3: 주문 관리 (주문 목록 + 실시간 통신 로그) ────────
+    # ── 화면 3: 주문 관리 (주문 목록 전용) ──────────────────────
     def _pageOrderAdmin(self) -> QWidget:
         page = QWidget()
         lay = QVBoxLayout(page)
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(14)
-        lay.addWidget(self._panelOrderList(), 2)
-        lay.addWidget(self._panelCommLog(), 3)
+        # 통신 로그가 통신 로그 탭으로 빠져서 주문 목록이 화면을 다 쓴다
+        lay.addWidget(self._panelOrderList(), 1)
+        return page
+
+    # ── 화면 6: 통신 로그 ────────────────────────────────────────
+    def _pageCommLog(self) -> QWidget:
+        page = QWidget()
+        lay = QVBoxLayout(page)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(14)
+        lay.addWidget(self._panelCommLog(), 1)
         return page
 
     # ── 화면 4: 재고 관리 ────────────────────────────────────────
@@ -553,7 +595,9 @@ class AdminDashboard(QMainWindow):
         box.setProperty("dirty", False)   # 보냈으니 폴링이 서버 값으로 덮어도 된다
         self._net.send({"cmd": "updateStock",
                         "productId": productId, "newStock": newStock})
-        self._addAlert(f"재고 수정 요청: 상품 {productId} → {newStock}개", COL_SUBTLE)
+        name = next((p.get("name") for p in self._products
+                     if p.get("id") == productId), f"상품 {productId}")
+        self._addAlert(f"{name} 재고를 {newStock}개로 수정했습니다", COL_SUBTLE)
 
     # ── 화면 5: 회원 관리 ────────────────────────────────────────
     def _pageMemberAdmin(self) -> QWidget:
@@ -817,16 +861,21 @@ class AdminDashboard(QMainWindow):
         bar.addWidget(resetBtn)
         body.addLayout(bar)
 
-        table = QTableWidget(0, 5)
-        table.setHorizontalHeaderLabels(["주문번호", "카드", "상태", "슬롯", "상품"])
+        table = QTableWidget(0, len(ORDER_COLUMNS))
+        table.setHorizontalHeaderLabels(ORDER_COLUMNS)
         table.verticalHeader().setVisible(False)
         table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         table.setStyleSheet(
             f"QTableWidget{{background:{COL_PANEL};color:{COL_TEXT};"
             f"gridline-color:{COL_LINE};border:none;}}"
             f"QHeaderView::section{{background:{COL_PANEL_HDR};color:{COL_SUBTLE};"
             f"border:none;padding:6px;}}")
-        table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        head = table.horizontalHeader()
+        # 컬럼이 9개라 전부 늘리면 다 뭉개진다. 상품 칸만 남는 폭을 가져간다.
+        for col in range(len(ORDER_COLUMNS)):
+            head.setSectionResizeMode(col, QHeaderView.ResizeMode.ResizeToContents)
+        head.setSectionResizeMode(ORDER_COL_ITEMS, QHeaderView.ResizeMode.Stretch)
         self._orderListTable = table
         body.addWidget(table)
         return frame
@@ -910,7 +959,7 @@ class AdminDashboard(QMainWindow):
         self._logCount.setText(f"{table.rowCount()}줄")
 
     def _refreshOrderList(self):
-        """주문 관리 탭의 주문 목록. 대시보드 표보다 상품 내역을 더 보여준다."""
+        """주문 관리 탭의 주문 목록. 대시보드 표보다 훨씬 자세히 보여준다."""
         table = self._orderListTable
         if table is None:
             return
@@ -919,18 +968,35 @@ class AdminDashboard(QMainWindow):
         for r, o in enumerate(rows):
             slot = o.get("assignedSlot")
             status = o.get("status", "-")
-            items = o.get("items") or []
-            itemText = ", ".join(f"#{it.get('productId')}×{it.get('qty')}"
-                                 for it in items) if items else "-"
-            values = [str(o.get("id", "-")), self._cardLabel(o),
-                      status, str(slot) if slot else "-", itemText]
+            cardUid = o.get("cardUid")
+            values = [
+                str(o.get("id", "-")),
+                o.get("memberName") or "-",
+                cardUid.upper() if cardUid else "-",
+                status,
+                str(slot) if slot else "-",
+                formatPrice(o.get("totalPrice")),
+                formatStamp(o.get("createdAt")),
+                formatStamp(o.get("paidAt")),
+                self._itemsLabel(o),
+            ]
             for c, value in enumerate(values):
                 item = QTableWidgetItem(value)
-                if c != 4:
+                if c != ORDER_COL_ITEMS:
                     item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-                if c == 2:
+                if c == ORDER_COL_STATUS:
                     item.setForeground(QColor(STATUS_COLOR.get(status, COL_TEXT)))
                 table.setItem(r, c, item)
+
+    @staticmethod
+    def _itemsLabel(order: dict) -> str:
+        """상품명×수량. 이름이 없으면(상품이 지워졌으면) id 로 떨어진다."""
+        items = order.get("items") or []
+        if not items:
+            return "-"
+        return ", ".join(
+            f"{it.get('name') or ('상품 ' + str(it.get('productId')))}×{it.get('qty')}"
+            for it in items)
 
     def _panelCamera(self, camId: str, label: str) -> QFrame:
         frame, body = panel(f"{label} 카메라")
@@ -946,7 +1012,9 @@ class AdminDashboard(QMainWindow):
 
     # ── 패널: 실시간 주문 현황 (SR-23) ───────────────────────────
     def _panelOrders(self) -> QFrame:
-        frame, body = panel("실시간 주문 현황")
+        # 눌러서 주문 관리 탭으로. 표 내용은 그대로 둔다(요약본 역할).
+        frame, body = panel("실시간 주문 현황",
+                            onClick=lambda: self._gotoMenu("주문 관리"))
         table = QTableWidget(0, 4)
         table.setHorizontalHeaderLabels(["주문번호", "카드", "상태", "슬롯"])
         table.verticalHeader().setVisible(False)
@@ -1080,14 +1148,21 @@ class AdminDashboard(QMainWindow):
         v.addWidget(badge)
         return w
 
-    # ── 패널: 화재·이상 알림 (SR-30) ─────────────────────────────
+    # ── 패널: 이상 알림 (SR-30) ──────────────────────────────────
     def _panelAlerts(self) -> QFrame:
-        frame, body = panel("화재·이상 알림")
+        # 눌러서 통신 로그 탭으로 — 알림은 "무슨 일이 있었나" 만 알려주고,
+        # 그 근거가 되는 원본 메시지는 통신 로그에서 본다.
+        frame, body = panel("이상 알림", onClick=lambda: self._gotoMenu("통신 로그"))
         lst = QListWidget()
         lst.setStyleSheet(
             f"QListWidget{{background:{COL_PANEL};color:{COL_TEXT};border:none;}}"
             f"QListWidget::item{{padding:8px;border-bottom:1px solid {COL_LINE};}}")
         lst.addItem("· 알림 없음 — 정상 운영 중")
+        # 목록을 눌러도 패널을 누른 것과 같게(리스트가 클릭을 먹어버린다)
+        lst.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+        lst.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        lst.itemClicked.connect(lambda _: self._gotoMenu("통신 로그"))
+        lst.setCursor(Qt.CursorShape.PointingHandCursor)
         self._alertsList = lst
         body.addWidget(lst)
         return frame
@@ -1405,7 +1480,9 @@ class AdminDashboard(QMainWindow):
         elif state == OrderStatus.DONE:
             self._freeSlotOf(orderId)
         elif state == OrderStatus.ERROR:
-            self._addAlert(f"주문 {orderId} 이상 감지", COL_DANGER)
+            who = order.get("memberName") or "손님"
+            self._addAlert(f"주문 {orderId}번({who}) 출고에 실패했습니다 — "
+                           f"픽업함과 상품을 확인해주세요", COL_DANGER)
 
         self._refreshOrders()
         self._refreshSlots()
@@ -1432,13 +1509,27 @@ class AdminDashboard(QMainWindow):
         self._refreshSlots()
 
     def _hAlert(self, msg: dict):
-        """화재/환경 이상 push (서버에 구현되면 그대로 받는다)"""
+        """서버가 올린 이상 상황 push.
+
+        ★ 여기에는 payload 를 그대로 찍지 않는다. 이 패널은 '지금 뭘 해야
+          하는지' 를 읽는 곳이고, 원본 메시지는 통신 로그 탭에서 본다.
+        """
         level = msg.get("level", "warn")
         col = {"info": COL_OK, "warn": COL_WARN}.get(level, COL_DANGER)
-        self._addAlert(msg.get("message") or msg.get("reason") or "이상 감지", col)
+        self._addAlert(msg.get("message") or msg.get("reason") or "이상이 감지됐습니다",
+                       col)
 
     def _hError(self, msg: dict):
-        self._addAlert(f"서버 오류: {msg.get('reason', '알 수 없음')}", COL_DANGER)
+        reason = msg.get("reason", "")
+        text = {
+            "badJson": "서버가 알아듣지 못한 요청이 있었습니다",
+        }.get(reason, "")
+        if not text:
+            if reason.startswith("unknownCmd:"):
+                text = f"서버가 모르는 요청입니다 ({reason.split(':', 1)[1]})"
+            else:
+                text = f"서버 처리 중 문제가 생겼습니다 ({reason or '원인 불명'})"
+        self._addAlert(text, COL_DANGER)
 
     # ── 슬롯 헬퍼 ────────────────────────────────────────────────
     def _rebuildSlotsFromOrders(self):
