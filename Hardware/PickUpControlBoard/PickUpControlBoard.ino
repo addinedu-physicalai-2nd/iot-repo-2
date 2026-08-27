@@ -96,7 +96,16 @@ void sendSlotState(int slotNumber, bool occupied)
   Serial.println();
 }
 
-// 슬롯 상태 확인
+// 슬롯 상태 확인 (디바운스 포함)
+//
+// 물건이 떨어질 때 튀어오르면서 센서가 순간적으로 "없음"을 잘못 읽을 수 있다.
+// 이걸 그대로 보내면 서버가 "손님이 벌써 찾아갔다"로 착각해서 주문을 완료
+// 처리해버린다. 그래서 값이 debounceDelay 동안 안정적으로 유지될 때만
+// 진짜 상태 변화로 보고 이벤트를 보낸다.
+const unsigned long debounceDelay = 200;   // ms — 필요하면 조정
+bool rawOccupied[3] = {false, false, false};
+unsigned long lastChangeTime[3] = {0, 0, 0};
+
 void checkSlots()
 {
   for (int i = 0; i < 3; i++)
@@ -104,8 +113,17 @@ void checkSlots()
     int value = analogRead(sensorPins[i]);
     bool occupied = (value < threshold);
 
-    if (occupied != slotOccupied[i])
+    if (occupied != rawOccupied[i])
     {
+      // 센서값이 방금 바뀌었다 — 안정될 때까지 타이머 리셋
+      rawOccupied[i] = occupied;
+      lastChangeTime[i] = millis();
+    }
+
+    if (occupied != slotOccupied[i]
+        && (millis() - lastChangeTime[i]) >= debounceDelay)
+    {
+      // 바뀐 값이 debounceDelay 동안 그대로 유지됐다 — 진짜 변화로 인정
       slotOccupied[i] = occupied;
       sendSlotState(i + 1, occupied);
     }
