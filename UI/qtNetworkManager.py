@@ -1,11 +1,11 @@
 """
-qtService.py — Qt 쪽 네트워크 경계
+qtNetworkManager.py — Qt 쪽 네트워크 경계
 
 서버의 network/networkManager.py 와 대칭이다.
 UI(adminQt / customerQt)는 포트도 소켓도 프로토콜도 모른다.
-QtService 에 명령을 넣고, 시그널로 결과를 받아 화면만 그린다.
+QtNetworkManager 에 명령을 넣고, 시그널로 결과를 받아 화면만 그린다.
 
-  QtService       바깥 창구. 아래 둘을 소유하고 신호를 모아준다
+  QtNetworkManager 바깥 창구. 아래 둘을 소유하고 신호를 모아준다
     ServiceClient   TCP :9000  제어 채널 — JSON 한 줄 (요청/응답 + 서버 push)
     ImageReceiver   UDP        영상 채널 — 서버가 쏘는 청크를 재조립
 
@@ -148,7 +148,7 @@ class ServiceClient(_ReconnectingSocket):
             try:
                 msg = json.loads(raw.decode("utf-8"))
             except (json.JSONDecodeError, UnicodeDecodeError) as e:
-                print(f"[QtService] 파싱 실패: {e}")
+                print(f"[QtNetworkManager] 파싱 실패: {e}")
                 continue
             if isinstance(msg, dict):
                 self.message.emit(msg)
@@ -237,7 +237,7 @@ class ImageReceiver(QObject):
         self._statLost += len(stale)
 
 
-class QtService(QObject):
+class QtNetworkManager(QObject):
     """UI 가 쓰는 창구. 포트와 소켓을 여기서 감춘다."""
 
     connected = pyqtSignal()

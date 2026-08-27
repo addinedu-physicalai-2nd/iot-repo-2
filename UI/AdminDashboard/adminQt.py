@@ -1,11 +1,11 @@
 """
 adminQt.py — SmartMart 무인매장 관리자 대시보드 (PyQt6)
 
-★ 이 파일은 화면만 그린다. 네트워크는 qtService.QtService 가 전담한다.
+★ 이 파일은 화면만 그린다. 네트워크는 qtNetworkManager.QtNetworkManager 가 전담한다.
   포트 번호도 소켓도 여기 없다.
 
 좌측 사이드 메뉴 + 정보 패널 + 하단 상태바.
-네트워크는 qtService.QtService 가 전담한다(제어 TCP :9000 + 영상 UDP).
+네트워크는 qtNetworkManager.QtNetworkManager 가 전담한다(제어 TCP :9000 + 영상 UDP).
 더미 데이터는 없다 — 모든 패널은 서버 응답과 push 로 채워진다.
 
 패널별 데이터 출처:
@@ -14,8 +14,8 @@ adminQt.py — SmartMart 무인매장 관리자 대시보드 (PyQt6)
   - 픽업 슬롯 상태     (SR-11) pickupReady / slotReleased push
   - 컨베이어 상태      (SR-08) dispatchStatus 로부터 유도(출고중 주문 유무)
   - 화재·이상 알림     (SR-30) alert push + 이상감지 상태 + 서버 연결 끊김
-  - 서버 연결 상태     (SR-07) QtService.connected / disconnected
-  - 영상 모니터링      (SR-25) QtService.watchCamera — UDP 로 JPEG 청크 수신
+  - 서버 연결 상태     (SR-07) QtNetworkManager.connected / disconnected
+  - 영상 모니터링      (SR-25) QtNetworkManager.watchCamera — UDP 로 JPEG 청크 수신
 
 화면 구성:
   사이드바 메뉴로 QStackedWidget 을 전환한다. '영상 모니터링' 을 볼 때만
@@ -36,7 +36,7 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-_UI_DIR = Path(__file__).resolve().parent.parent      # UI/  (theme.py, qtService.py 가 여기 있음)
+_UI_DIR = Path(__file__).resolve().parent.parent      # UI/  (theme.py, qtNetworkManager.py 가 여기 있음)
 _REPO_ROOT = _UI_DIR.parent                             # 저장소 루트 (Library/ 가 여기 있음)
 sys.path.insert(0, str(_UI_DIR))
 sys.path.insert(0, str(_REPO_ROOT))
@@ -55,7 +55,7 @@ from UI.theme import (
     COL_BG, COL_PANEL, COL_PANEL_HDR, COL_SIDE, COL_SIDE_SEL,
     COL_TEXT, COL_SUBTLE, COL_LINE, COL_OK, COL_WARN, COL_DANGER,
 )
-from qtService import QtService
+from qtNetworkManager import QtNetworkManager
 
 
 # 주문 상태별 표시색 (protocol.OrderStatus 와 1:1)
@@ -240,8 +240,8 @@ class AdminDashboard(QMainWindow):
         self._videoFpsTimer.timeout.connect(self._tickVideoFps)
         self._videoFpsTimer.start(1000)
 
-        # ── 서버 연결 — 전송 방식은 QtService 가 감춘다 ──────────
-        self._net = QtService(host, port, parent=self)
+        # ── 서버 연결 — 전송 방식은 QtNetworkManager 가 감춘다 ────
+        self._net = QtNetworkManager(host, port, parent=self)
         self._net.connected.connect(self._onConnected)
         self._net.disconnected.connect(self._onDisconnected)
         self._net.message.connect(self._onMessage)
@@ -795,7 +795,7 @@ class AdminDashboard(QMainWindow):
         body.addWidget(view, 1)
         body.addWidget(status)
 
-        # 영상 수신은 QtService 가 맡는다. 여기는 그릴 위젯만 등록한다.
+        # 영상 수신은 QtNetworkManager 가 맡는다. 여기는 그릴 위젯만 등록한다.
         self._cams[camId] = {"view": view, "status": status, "count": 0}
         return frame
 

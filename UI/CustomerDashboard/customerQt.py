@@ -1,7 +1,7 @@
 """
 customerQt.py — 고객용 무인매장 키오스크 (PyQt6)
 
-★ 이 파일은 화면만 그린다. 네트워크는 qtService.QtService 가 전담한다.
+★ 이 파일은 화면만 그린다. 네트워크는 qtNetworkManager.QtNetworkManager 가 전담한다.
   관리자 화면과 같은 서비스를 쓰되, 영상은 쓰지 않아 제어 채널만 연다.
 
 화면 흐름:
@@ -40,7 +40,7 @@ import argparse
 import sys
 from pathlib import Path
 
-_UI_DIR = Path(__file__).resolve().parent.parent      # UI/  (theme.py, qtService.py 가 여기 있음)
+_UI_DIR = Path(__file__).resolve().parent.parent      # UI/  (theme.py, qtNetworkManager.py 가 여기 있음)
 _REPO_ROOT = _UI_DIR.parent                             # 저장소 루트 (Library/ 가 여기 있음)
 sys.path.insert(0, str(_UI_DIR))
 sys.path.insert(0, str(_REPO_ROOT))
@@ -53,7 +53,7 @@ from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtGui import QIntValidator
 
 from Library.protocol import OrderStatus
-from qtService import QtService
+from qtNetworkManager import QtNetworkManager
 from UI.theme import (
     COL_BG, COL_PANEL, COL_PANEL_HDR, COL_SIDE_SEL, COL_TEXT,
     COL_SUBTLE, COL_LINE, COL_OK, COL_WARN, COL_DANGER,
@@ -308,7 +308,7 @@ class CustomerKiosk(QMainWindow):
         outer.addWidget(self._statusBar())
 
         # ── 서버 연결 ────────────────────────────────────────────
-        self._net = QtService(host, port, parent=self)
+        self._net = QtNetworkManager(host, port, parent=self)
         self._net.connected.connect(self._onConnected)
         self._net.disconnected.connect(self._onDisconnected)
         self._net.message.connect(self._onMessage)
