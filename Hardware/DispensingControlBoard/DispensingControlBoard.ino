@@ -55,8 +55,8 @@ Stepper myStepper(stepsPerRevolution, 23, 21, 22, 19);
 
 Servo servos[4];
 
-const int homeAngle[3] = {0, 0, 175};
-const int pushAngle[3] = {45, 45, 130};
+const int homeAngle[3] = {5, 0, 175};
+const int pushAngle[3] = {50, 45, 130};
 const int slotAngle[3] = {80, 100, 120};
 
 int currentAngle[4] = {0, 0, 0, 0};
@@ -354,8 +354,8 @@ void setup()
 
   servos[3].setPeriodHertz(50);
   servos[3].attach(servoSlotPin, 500, 2400);
-  servos[3].write(90);
-  currentAngle[3] = 90;
+  servos[3].write(100);
+  currentAngle[3] = 100;
 
   myStepper.setSpeed(14);
 
