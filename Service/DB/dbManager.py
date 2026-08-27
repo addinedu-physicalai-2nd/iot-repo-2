@@ -20,6 +20,15 @@ load_dotenv(_MODULE_DIR / ".env")   # cwd 와 무관하게 항상 이 파일 옆
 
 _SCHEMA_PATH = _MODULE_DIR / "Schema.SQL"
 
+# ★ 세션 시간대를 못 박는다.
+#   created_at / paid_at 은 DATETIME DEFAULT CURRENT_TIMESTAMP 라 "그 순간
+#   MySQL 세션의 시간대" 로 기록된다. RDS 는 기본이 UTC 라, 아무것도 안 하면
+#   한국 시각보다 9시간 이른 값이 저장되고 관리자 화면에는 그게 그대로 찍힌다.
+#   DATETIME 은 시간대 정보를 안 들고 다녀서 읽을 때 보정할 방법도 없다.
+#   그래서 쓰는 시점부터 KST 로 맞춘다. (해외 배포 시 DB_TIMEZONE 로 교체)
+_TIMEZONE = os.getenv("DB_TIMEZONE", "+09:00")
+_INIT_COMMAND = f"SET time_zone = '{_TIMEZONE}'"
+
 # orders 테이블 컬럼(snake_case) -> 서버가 쓰는 camelCase 로 alias.
 # mainService.Order.fromDbRow() 가 cardId/assignedSlot 키를 그대로 기대한다.
 # card/member 를 조인해서 cardUid/memberName 도 같이 준다 — 관리자 화면 표시용.
@@ -60,6 +69,7 @@ class DBManager:
             charset="utf8mb4",
             cursorclass=DictCursor,
             autocommit=True,
+            init_command=_INIT_COMMAND,   # 끊겼다 다시 붙을 때도 자동 재실행된다
         )
 
     def _connect(self):
@@ -74,6 +84,7 @@ class DBManager:
         conn = pymysql.connect(
             host=self.host, port=self.port, user=self.user,
             password=self.password, charset="utf8mb4", autocommit=True,
+            init_command=_INIT_COMMAND,
         )
         try:
             sql = _SCHEMA_PATH.read_text(encoding="utf-8")
@@ -135,7 +146,7 @@ class DBManager:
                 "SELECT c.id, c.uid, c.created_at AS createdAt, "
                 "m.id AS memberId, m.name AS memberName, m.contact "
                 "FROM card c JOIN member m ON c.member_id = m.id "
-                "ORDER BY c.id"
+                "ORDER BY c.created_at, m.name, c.id"
             )
             return cur.fetchall()
 
@@ -174,6 +185,71 @@ class DBManager:
                 (memberId, uid),
             )
             return True, cur.lastrowid
+
+    def updateMember(self, memberId, name, contact=None):
+        """회원의 이름/연락처를 고친다. 반환: (True, None) / (False, 사유)
+
+        카드 UID 는 물리 카드가 정본이라 여기서 못 바꾼다. 카드를 바꾸려면
+        새로 등록하는 게 맞다.
+        """
+        name = (name or "").strip()
+        if memberId is None:
+            return False, "noMember"
+        if not name:
+            return False, "noName"
+
+        conn = self._connect()
+        with conn.cursor() as cur:
+            cur.execute("SELECT id FROM member WHERE id = %s", (memberId,))
+            if cur.fetchone() is None:
+                return False, "noMember"
+            cur.execute(
+                "UPDATE member SET name = %s, contact = %s WHERE id = %s",
+                (name, (contact or "").strip() or None, memberId),
+            )
+            return True, None
+
+    def deleteMember(self, memberId):
+        """회원과 그 회원의 카드를 지운다. 반환: (True, 끊긴 주문 수) / (False, 사유)
+
+        ★ 주문 이력은 지우지 않는다. orders.card_id 만 NULL 로 끊는다.
+          매출 기록까지 사라지면 안 되기 때문이다. 대신 그 주문들은 관리자
+          화면에서 회원명 대신 '-' 로 보이게 된다.
+
+        여러 테이블을 건드리므로 명시적 트랜잭션으로 묶는다. 중간에 실패하면
+        카드만 지워지고 회원이 남는 식의 어중간한 상태가 생긴다.
+        """
+        if memberId is None:
+            return False, "noMember"
+
+        conn = self._connect()
+        try:
+            conn.begin()
+            with conn.cursor() as cur:
+                cur.execute("SELECT id FROM member WHERE id = %s", (memberId,))
+                if cur.fetchone() is None:
+                    conn.rollback()
+                    return False, "noMember"
+
+                cur.execute("SELECT id FROM card WHERE member_id = %s", (memberId,))
+                cardIds = [row["id"] for row in cur.fetchall()]
+
+                orphaned = 0
+                if cardIds:
+                    marks = ", ".join(["%s"] * len(cardIds))
+                    cur.execute(
+                        f"UPDATE orders SET card_id = NULL WHERE card_id IN ({marks})",
+                        cardIds,
+                    )
+                    orphaned = cur.rowcount
+                    cur.execute("DELETE FROM card WHERE member_id = %s", (memberId,))
+
+                cur.execute("DELETE FROM member WHERE id = %s", (memberId,))
+            conn.commit()
+            return True, orphaned
+        except Exception:
+            conn.rollback()
+            raise
 
     def createOrder(self, cardId, items):
         """

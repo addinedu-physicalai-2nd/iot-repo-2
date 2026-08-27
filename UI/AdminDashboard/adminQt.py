@@ -46,6 +46,7 @@ from PyQt6.QtWidgets import (
     QVBoxLayout, QHBoxLayout, QGridLayout, QTableWidget, QTableWidgetItem,
     QHeaderView, QListWidget, QListWidgetItem, QStackedWidget, QSizePolicy,
     QAbstractItemView, QMessageBox, QLineEdit, QSpinBox, QScrollArea,
+    QDialog, QDialogButtonBox, QFormLayout,
 )
 from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtGui import QFont, QColor, QPixmap
@@ -147,6 +148,29 @@ def clearLayout(lay):
         if w is not None:
             w.setParent(None)
             w.deleteLater()
+
+
+def formatContact(raw) -> str:
+    """연락처를 하이픈 형식으로 통일해 보여준다.
+
+    입력이 제각각이라(01012345678 / 010 1234 5678 / 010-1234-5678)
+    숫자만 뽑아 자릿수로 판단해 다시 끼운다. 아는 형태가 아니면
+    원문을 그대로 둔다 — 멋대로 자르면 오히려 못 읽는다.
+    """
+    text = str(raw or "").strip()
+    if not text:
+        return "-"
+    digits = "".join(ch for ch in text if ch.isdigit())
+
+    if len(digits) == 11:                       # 010-1234-5678
+        return f"{digits[:3]}-{digits[3:7]}-{digits[7:]}"
+    if len(digits) == 10:
+        if digits.startswith("02"):             # 02-1234-5678
+            return f"{digits[:2]}-{digits[2:6]}-{digits[6:]}"
+        return f"{digits[:3]}-{digits[3:6]}-{digits[6:]}"   # 031-123-4567
+    if len(digits) == 9 and digits.startswith("02"):        # 02-123-4567
+        return f"{digits[:2]}-{digits[2:5]}-{digits[5:]}"
+    return text
 
 
 def hintLabel(text: str) -> QLabel:
@@ -544,8 +568,8 @@ class AdminDashboard(QMainWindow):
     def _panelMemberList(self) -> QFrame:
         frame, body = panel("등록된 카드")
 
-        table = QTableWidget(0, 4)
-        table.setHorizontalHeaderLabels(["회원명", "연락처", "카드 UID", "등록일"])
+        table = QTableWidget(0, 5)
+        table.setHorizontalHeaderLabels(["회원명", "연락처", "카드 UID", "등록일", "관리"])
         table.verticalHeader().setVisible(False)
         table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
@@ -554,23 +578,38 @@ class AdminDashboard(QMainWindow):
             f"gridline-color:{COL_LINE};border:none;}}"
             f"QHeaderView::section{{background:{COL_PANEL_HDR};color:{COL_SUBTLE};"
             f"border:none;padding:6px;}}")
-        table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        header = table.horizontalHeader()
+        header.setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        # 버튼 두 개가 들어가는 칸이라 내용에 맞춘다(늘리면 버튼이 흩어진다)
+        header.setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
         self._memberTable = table
         body.addWidget(table)
         return frame
+
+    @staticmethod
+    def _memberSortKey(member: dict):
+        """등록일 오래된 순 → 같은 날이면 이름 순.
+
+        createdAt 이 datetime 이 아니라 문자열로 올 수도 있어서(서버가 str()
+        로 흘리는 경로가 있다) 양쪽 다 정렬되게 문자열로 맞춘다.
+        """
+        created = member.get("createdAt")
+        stamp = (created.isoformat(sep=" ") if hasattr(created, "isoformat")
+                 else str(created or ""))
+        return (stamp, (member.get("memberName") or "").strip())
 
     def _refreshMembers(self):
         table = self._memberTable
         table.setRowCount(0)
         if not self._members:
             return
-        for member in self._members:
+        for member in sorted(self._members, key=self._memberSortKey):
             row = table.rowCount()
             table.insertRow(row)
             created = member.get("createdAt")
             cells = [
                 member.get("memberName") or "-",
-                member.get("contact") or "-",
+                formatContact(member.get("contact")),
                 (member.get("uid") or "-").upper(),
                 created.strftime("%Y-%m-%d %H:%M") if hasattr(created, "strftime")
                 else str(created or "-"),
@@ -579,6 +618,104 @@ class AdminDashboard(QMainWindow):
                 item = QTableWidgetItem(text)
                 item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
                 table.setItem(row, col, item)
+            table.setCellWidget(row, 4, self._memberActions(member))
+
+    def _memberActions(self, member: dict) -> QWidget:
+        """행마다 붙는 [수정] [삭제] 버튼.
+
+        member 를 통째로 넘겨 잡아둔다. 행 번호로 잡으면 목록이 갱신될 때
+        엉뚱한 회원을 건드린다(폴링이 10초마다 목록을 새로 그린다).
+        """
+        box = QWidget()
+        lay = QHBoxLayout(box)
+        lay.setContentsMargins(4, 2, 4, 2)
+        lay.setSpacing(6)
+
+        editBtn = QPushButton("수정")
+        editBtn.setCursor(Qt.CursorShape.PointingHandCursor)
+        editBtn.setStyleSheet(
+            f"QPushButton{{background:{COL_PANEL_HDR};color:{COL_TEXT};"
+            f"border:1px solid {COL_LINE};border-radius:5px;padding:4px 12px;}}"
+            f"QPushButton:hover{{background:{COL_LINE};}}")
+        editBtn.clicked.connect(lambda _, m=member: self._openMemberEdit(m))
+
+        delBtn = QPushButton("삭제")
+        delBtn.setCursor(Qt.CursorShape.PointingHandCursor)
+        delBtn.setStyleSheet(
+            f"QPushButton{{background:{COL_PANEL_HDR};color:{COL_DANGER};"
+            f"border:1px solid {COL_DANGER};border-radius:5px;padding:4px 12px;}}"
+            f"QPushButton:hover{{background:{COL_DANGER};color:white;}}")
+        delBtn.clicked.connect(lambda _, m=member: self._confirmDeleteMember(m))
+
+        lay.addWidget(editBtn)
+        lay.addWidget(delBtn)
+        return box
+
+    def _openMemberEdit(self, member: dict):
+        """이름·연락처 수정 창. 카드 UID 는 물리 카드가 정본이라 못 고친다."""
+        dlg = QDialog(self)
+        dlg.setWindowTitle("회원 정보 수정")
+        dlg.setStyleSheet(f"background:{COL_BG};color:{COL_TEXT};")
+        dlg.setMinimumWidth(340)
+
+        form = QFormLayout(dlg)
+        form.setContentsMargins(20, 18, 20, 14)
+        form.setSpacing(10)
+
+        uid = QLabel((member.get("uid") or "-").upper())
+        uid.setStyleSheet(f"color:{COL_SUBTLE};font-size:13px;")
+        form.addRow("카드 UID", uid)
+
+        nameEdit = self._formEdit("이름", 200)
+        nameEdit.setReadOnly(False)
+        nameEdit.setText(member.get("memberName") or "")
+        form.addRow("회원명", nameEdit)
+
+        contactEdit = self._formEdit("연락처 (선택)", 200)
+        contactEdit.setReadOnly(False)
+        contactEdit.setText(member.get("contact") or "")
+        form.addRow("연락처", contactEdit)
+
+        hint = QLabel("")
+        hint.setStyleSheet(f"color:{COL_DANGER};font-size:12px;")
+        form.addRow(hint)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
+        buttons.button(QDialogButtonBox.StandardButton.Save).setText("저장")
+        buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("취소")
+        buttons.rejected.connect(dlg.reject)
+
+        def onSave():
+            if not nameEdit.text().strip():
+                hint.setText("이름을 입력해주세요")
+                return
+            dlg.accept()
+
+        buttons.accepted.connect(onSave)
+        form.addRow(buttons)
+
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        self._net.send({"cmd": "updateMember",
+                        "memberId": member.get("memberId"),
+                        "name": nameEdit.text().strip(),
+                        "contact": contactEdit.text().strip() or None})
+
+    def _confirmDeleteMember(self, member: dict):
+        """회원 삭제. 주문 이력은 남고 회원 연결만 끊긴다 — 되돌릴 수 없어서 확인받는다."""
+        name = member.get("memberName") or "이 회원"
+        ok = QMessageBox.question(
+            self, "회원 삭제",
+            f"{name} 님과 등록된 카드를 삭제합니다.\n\n"
+            "주문 이력은 지워지지 않지만, 그 주문들은 회원명 없이 '-' 로 표시됩니다.\n"
+            "되돌릴 수 없습니다. 계속할까요?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if ok != QMessageBox.StandardButton.Yes:
+            return
+        self._net.send({"cmd": "deleteMember", "memberId": member.get("memberId")})
 
     def _panelCardRegister(self) -> QFrame:
         frame, body = panel("새 카드 등록")
@@ -600,7 +737,12 @@ class AdminDashboard(QMainWindow):
         self._readCardBtn.clicked.connect(self._requestReadCard)
         form.addWidget(self._readCardBtn)
 
-        self._uidEdit = self._formEdit("카드 UID (읽기 또는 직접 입력)", 220)
+        # ★ UID 는 손으로 못 넣는다. 오타 하나로 존재하지 않는 카드가 등록되면
+        #   그 카드는 영영 태그가 안 되는데 화면상으로는 멀쩡해 보인다.
+        #   반드시 리더기가 읽은 값만 들어간다.
+        self._uidEdit = self._formEdit("[카드 읽기] 를 눌러주세요", 220)
+        self._uidEdit.setReadOnly(True)
+        self._uidEdit.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self._nameEdit = self._formEdit("이름", 140)
         self._contactEdit = self._formEdit("연락처 (선택)", 160)
         form.addWidget(self._uidEdit)
@@ -631,7 +773,10 @@ class AdminDashboard(QMainWindow):
         edit.setFixedWidth(width)
         edit.setStyleSheet(
             f"QLineEdit{{background:{COL_BG};color:{COL_TEXT};"
-            f"border:1px solid {COL_LINE};border-radius:6px;padding:8px;}}")
+            f"border:1px solid {COL_LINE};border-radius:6px;padding:8px;}}"
+            # 읽기 전용 칸(카드 UID)은 눌러도 안 써진다는 걸 색으로 알린다
+            f"QLineEdit[readOnly=\"true\"]{{background:{COL_PANEL_HDR};"
+            f"color:{COL_SUBTLE};}}")
         return edit
 
     def _setRegisterHint(self, text: str, color: str = COL_SUBTLE):
@@ -647,7 +792,7 @@ class AdminDashboard(QMainWindow):
         uid = self._uidEdit.text().strip()
         name = self._nameEdit.text().strip()
         if not uid:
-            self._setRegisterHint("카드 UID 가 없습니다. [카드 읽기] 를 눌러주세요", COL_DANGER)
+            self._setRegisterHint("카드를 리더기에 올리고 [카드 읽기] 를 눌러주세요", COL_DANGER)
             return
         if not name:
             self._setRegisterHint("이름을 입력해주세요", COL_DANGER)
@@ -1131,6 +1276,8 @@ class AdminDashboard(QMainWindow):
             "memberData":         self._hMemberData,
             "readCardResult":     self._hReadCardResult,
             "registerCardResult": self._hRegisterCardResult,
+            "updateMemberResult": self._hUpdateMemberResult,
+            "deleteMemberResult": self._hDeleteMemberResult,
             "resetTestDataResult": self._hResetTestDataResult,
             # push (broadcast)
             "dispatchStatus":     self._hDispatchStatus,
@@ -1204,6 +1351,32 @@ class AdminDashboard(QMainWindow):
         for edit in (self._uidEdit, self._nameEdit, self._contactEdit):
             edit.clear()
         self._net.send({"cmd": "getMembers"})
+
+    def _hUpdateMemberResult(self, msg: dict):
+        if msg.get("success"):
+            self._addAlert("회원 정보를 수정했습니다", COL_OK)
+            self._net.send({"cmd": "getMembers"})
+            return
+        text = {
+            "noName": "이름을 입력해주세요",
+            "noMember": "회원 정보를 찾을 수 없습니다",
+        }.get(msg.get("reason", ""), f"회원 수정 실패 ({msg.get('reason')})")
+        self._addAlert(text, COL_DANGER)
+        QMessageBox.warning(self, "회원 수정 실패", text)
+
+    def _hDeleteMemberResult(self, msg: dict):
+        if msg.get("success"):
+            orphaned = msg.get("orders") or 0
+            note = f" (주문 {orphaned}건은 회원 표시 없이 남습니다)" if orphaned else ""
+            self._addAlert(f"회원을 삭제했습니다{note}", COL_OK)
+            # 주문 표의 회원명도 같이 바뀌므로 회원 목록만이 아니라 전체를 다시 받는다
+            self._requestRefresh()
+            return
+        text = {
+            "noMember": "이미 삭제된 회원입니다",
+        }.get(msg.get("reason", ""), f"회원 삭제 실패 ({msg.get('reason')})")
+        self._addAlert(text, COL_DANGER)
+        QMessageBox.warning(self, "회원 삭제 실패", text)
 
     def _hResetTestDataResult(self, msg: dict):
         if msg.get("success"):

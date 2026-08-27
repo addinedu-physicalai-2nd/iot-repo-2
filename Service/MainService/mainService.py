@@ -341,6 +341,25 @@ class MainService:
                 print(f"[MS] 카드 등록 실패: {detail} ({msg.get('uid')})")
                 resp = {"cmd": "registerCardResult", "success": False, "reason": detail}
 
+        elif cmd == "updateMember":
+            ok, reason = self.db.updateMember(
+                msg.get("memberId"), msg.get("name"), msg.get("contact"))
+            if ok:
+                print(f"[MS] 회원 {msg.get('memberId')} 정보 수정: {msg.get('name')}")
+                resp = {"cmd": "updateMemberResult", "success": True}
+            else:
+                print(f"[MS] 회원 수정 실패: {reason}")
+                resp = {"cmd": "updateMemberResult", "success": False, "reason": reason}
+
+        elif cmd == "deleteMember":
+            ok, detail = self.db.deleteMember(msg.get("memberId"))
+            if ok:
+                print(f"[MS] 회원 {msg.get('memberId')} 삭제 (주문 {detail}건 연결 해제)")
+                resp = {"cmd": "deleteMemberResult", "success": True, "orders": detail}
+            else:
+                print(f"[MS] 회원 삭제 실패: {detail}")
+                resp = {"cmd": "deleteMemberResult", "success": False, "reason": detail}
+
         elif cmd == "getHistory":
             resp = {"cmd": "historyData",
                     "orders": self.db.getOrdersByCard(msg["cardUid"])}
