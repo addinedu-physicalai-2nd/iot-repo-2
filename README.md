@@ -209,7 +209,7 @@ iot-repo-2/
 
 ### [B] 주문 
 
-![주문결제](./assets/B팀_Seq_Diagram_주문_02.png) 
+![주문](./assets/B팀_Seq_Diagram_주문_01.png) 
 
 ### [C] 결제
 
@@ -219,7 +219,7 @@ iot-repo-2/
 
 ### [D] 출고
 
-![출고](./assets/B팀_Seq_Diagram_출고_01.png)
+![출고](./assets/B팀_Seq_출고_01.png)
 
 ### [E] 픽업 완료
 
