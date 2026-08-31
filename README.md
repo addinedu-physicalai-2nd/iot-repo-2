@@ -56,10 +56,10 @@ IoT 프로젝트 2조 저장소. SmartMart
 | 분류 | 기술 구성 |
 |---|---|
 | **개발 환경** | Ubuntu Linux |
-| **MCU/펌웨어** | ESP32(WROOM/CAM), Arduino IDE |
+| **MCU/펌웨어** | ESP32(dev kit/CAM)|
 | **프로그래밍 언어** | Python, C++ |
 | **DB** | MySQL |
-| **버전 관리** | Git, GitHub |
+| **버전 관리** | Git |
 | **협업 도구** | Confluence (SR/UR → Architecture → Scenario Design → Interface Spec → ERD 순으로 설계 문서 체계화) |
 
 ---
