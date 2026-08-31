@@ -21,9 +21,10 @@ IoT 프로젝트 2조 저장소. SmartMart
 - [4. 시스템 설계](#4-시스템-설계)
 - [5. 주요 기능](#5-주요-기능)
 - [6. 통신 프로토콜](#6-통신-프로토콜)
-- [7. 기술적 문제 및 해결](#7-기술적-문제-및-해결)
-- [8. 구현 제약 및 확장 가능성](#8-구현-제약-및-확장-가능성)
-- [9. 팀 구성](#9-팀-구성)
+- [7. 시퀀스 다이어그램](#7-시퀀스-다이어그램)
+- [8. 기술적 문제 및 해결](#8-기술적-문제-및-해결)
+- [9. 구현 제약 및 확장 가능성](#9-구현-제약-및-확장-가능성)
+- [10. 팀 구성](#10-팀-구성)
 
 ---
 
@@ -64,6 +65,43 @@ IoT 프로젝트 2조 저장소. SmartMart
 ---
 
 # 4. 시스템 설계
+
+## 폴더 구조
+
+```
+iot-repo-2/
+│
+│
+├── Service/                   # 서버 (Python)
+│   └── MainService
+│   │   └── mainService.py     # 판단 전담 — 주문 상태를 메모리로 관리
+│   │
+│   ├──Network       
+│   │    ├── networkManager.py  # TCP · UDP · Serial 통신 전담
+│   │    ├── serialModule.py
+│   │    ├── TCPModule.py
+│   │    └── UDPModule.py
+│   │ 
+│   └──DB
+│       ├── dbManager.py       # MySQL 접근 전담 (기록·조회)
+│       └── schema.sql
+│
+├── Hardware/                  # ESP32 / Arduino 펌웨어(cpp)
+│   ├── dispensingBoard/       # 서보 4개 · 스텝모터 · IR센서(출고확인)
+│   ├── pickupBoard/           # IR센서 3개 · RFID 리더
+│   ├── pickupMonitoring/      # ESP32-CAM (계산대)
+│   └── dispensingMonitoring/  # ESP32-CAM (출고구)
+│
+├── UI/                        # 관리자 · 고객 GUI
+│   ├── qtNetworkManager/      # QT용 네트워크 매니저    
+│   ├── adminGui/
+│   └── customerGui/
+│
+├── assets/                    # README 첨부 이미지 · GIF
+├── .gitignore
+└── README.md
+```
+
 
 ## 매장 배치도
 
@@ -159,7 +197,41 @@ IoT 프로젝트 2조 저장소. SmartMart
 
 ---
 
-# 7. 기술적 문제 및 해결
+# 7. 시퀀스 다이어그램
+
+각 시나리오를 주체(고객 GUI · MainService · 픽업 보드/분배 보드 · DBManager) 간 메시지 교환 순서로 표현했습니다.
+
+### [A] 카드 태그
+
+![카드태그-1](./assets/B팀_Seq_Diagram_카드태그_01.png)
+
+![카드태그-2](./assets/B팀_Seq_Diagram_카드태그_02.png) 
+
+### [B] 주문 
+
+![주문결제](./assets/B팀_Seq_Diagram_주문_02.png) 
+
+### [C] 결제
+
+![결제-1](./assets/B팀_Seq_Diagram_결제_01.png)
+
+![결제-2](./assets/B팀_Seq_Diagram_결제_02.png)
+
+### [D] 출고
+
+![출고](./assets/B팀_Seq_Diagram_출고_01.png)
+
+### [E] 픽업 완료
+
+![픽업 완료](./assets/B팀_Seq_Diagram_픽업완료_01.png)
+
+### [F] 충전
+
+![충전](./assets/B팀_Seq_Diagram_충전_01.png)
+
+---
+
+# 8. 기술적 문제 및 해결
 
 ## CCTV UDP 영상이 갑자기 안 잡힘
 
@@ -184,7 +256,7 @@ IoT 프로젝트 2조 저장소. SmartMart
 
 ---
 
-# 8. 구현 제약 및 확장 가능성
+# 9. 구현 제약 및 확장 가능성
 
 ## 하드웨어적 한계
 
@@ -205,7 +277,7 @@ IoT 프로젝트 2조 저장소. SmartMart
 
 ---
 
-# 9. 팀 구성
+# 10. 팀 구성
 
 | 이름 | 담당 |
 |---|---|
